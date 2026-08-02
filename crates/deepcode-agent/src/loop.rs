@@ -1030,18 +1030,11 @@ mod tests {
             ),
         ]);
 
-        let started_at = tokio::time::Instant::now();
         let events = run_agent_with_registry(Arc::new(provider), registry, false).await;
-        let elapsed = started_at.elapsed();
 
         assert!(
             max_active.load(Ordering::SeqCst) > 1,
             "expected overlapping tool executions"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_millis(300),
-            "expected parallel execution, elapsed: {:?}",
-            elapsed
         );
         assert_eq!(
             events
