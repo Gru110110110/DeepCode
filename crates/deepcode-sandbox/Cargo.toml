@@ -1,0 +1,25 @@
+[package]
+name = "deepcode-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deepcode-core = { path = "../deepcode-core" }
+serde.workspace = true
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+sha2.workspace = true
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

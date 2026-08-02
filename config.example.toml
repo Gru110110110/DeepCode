@@ -1,0 +1,90 @@
+# DeepCode configuration
+# A single provider is activated automatically. Set active_provider only when
+# more than one provider is configured.
+
+default_permissions = "project-edit"
+
+[providers.deepseek]
+type = "deepseek"
+api_key = "your-api-key-here"
+base_url = "https://api.deepseek.com"
+
+# Optional selection overrides. By default DeepCode selects a recommended
+# tool-capable model and effort from the discovered catalog.
+# model = "deepseek-v4-flash"
+# reasoning_effort = "high"
+# wire_api = "responses" # optional: explicitly opt in to Responses API
+
+# Unknown/private models can override the conservative 32K/4K/off defaults.
+# [providers.deepseek.models."private-model"]
+# context_window = 131072
+# max_output_tokens = 16384
+# reasoning_efforts = ["off", "low", "high", "xhigh", "max"]
+# default_reasoning_effort = "high"
+
+# [providers.openai]
+# type = "openai"
+# api_key = "your-api-key-here"
+# base_url = "https://api.openai.com/v1"
+# wire_api = "responses" # optional: responses or chat_completions
+
+# [providers.anthropic]
+# type = "anthropic"
+# api_key = "your-api-key-here"
+# base_url = "https://api.anthropic.com/v1"
+
+# [providers.kimi]
+# type = "kimi"
+# api_key = "your-api-key-here"
+# base_url = "https://api.moonshot.ai/v1"
+
+# [providers.ollama]
+# type = "ollama"
+# base_url = "http://localhost:11434"
+
+[tools]
+disabled = []
+max_file_size_bytes = 1048576
+
+[permissions]
+# policy_files = ["~/.config/deepcode/policies/default.star"]
+# write_policy_file = "~/.config/deepcode/policies/user.star"
+
+[permissions.project-edit]
+description = "Workspace editing with explicit network and sensitive-file boundaries."
+extends = ":workspace"
+
+[permissions.project-edit.filesystem.":workspace_roots"]
+"." = "write"
+"**/.env*" = "deny"
+"Cargo.toml" = { write = "prompt" }
+"package.json" = { write = "prompt" }
+
+[permissions.project-edit.filesystem]
+"~/.ssh/**" = "deny"
+"~/.aws/**" = "deny"
+"/etc/**" = "deny"
+
+[permissions.project-edit.network]
+enabled = true
+default = "prompt"
+# audit_log = "~/.config/deepcode/network_audit.log"
+
+[permissions.project-edit.network.domains]
+"github.com" = "allow"
+"*.githubusercontent.com" = "allow"
+"169.254.169.254" = "deny"
+
+[[permissions.project-edit.shell.rules]]
+pattern = ["git", ["status", "diff", "log"]]
+decision = "allow"
+
+[[permissions.project-edit.shell.rules]]
+pattern = ["git", "push"]
+decision = "deny"
+
+[[permissions.project-edit.tool.rules]]
+tool = "git_checkout"
+action = "restore_files"
+decision = "prompt"
+justification = "Restoring files can overwrite local work."

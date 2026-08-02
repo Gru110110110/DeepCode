@@ -1,0 +1,36 @@
+[package]
+name = "deepcode-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "deepcode"
+path = "src/main.rs"
+
+[dependencies]
+deepcode-core = { path = "../deepcode-core" }
+deepcode-tools = { path = "../deepcode-tools" }
+deepcode-agent = { path = "../deepcode-agent" }
+deepcode-permissions = { path = "../deepcode-permissions" }
+deepcode-providers = { path = "../deepcode-providers" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+ratatui = "0.29"
+crossterm = "0.28"
+syntect = "5"
+unicode-width = "0.2"
+pulldown-cmark = "0.13"
+
+[dev-dependencies]
+deepcode-sandbox = { path = "../deepcode-sandbox" }

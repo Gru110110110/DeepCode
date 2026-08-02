@@ -1,0 +1,105 @@
+mod request;
+
+use deepcode_core::config::ProviderConfig;
+use deepcode_core::error::{DeepCodeError, Result};
+use deepcode_core::provider::traits::{
+    ContextCompressor, GenerateParams, LlmProvider, RequestBuilder, ResponseParser, StreamDelta,
+};
+use deepcode_core::types::{Message, ToolDefinition};
+use futures::stream::Stream;
+use std::pin::Pin;
+
+use crate::openai::compress::OpenAiContextCompressor;
+use crate::openai::response::OpenAiResponseParser;
+use crate::transport;
+
+pub(crate) struct KimiProvider {
+    client: reqwest::Client,
+    api_key: String,
+    base_url: String,
+    request_builder: request::KimiRequestBuilder,
+    response_parser: OpenAiResponseParser,
+    context_compressor: OpenAiContextCompressor,
+    limiter: transport::RequestLimiter,
+}
+
+impl KimiProvider {
+    pub(crate) fn new(config: &ProviderConfig) -> Result<Self> {
+        let api_key = config.resolve_api_key().ok_or_else(|| {
+            DeepCodeError::Config("Kimi API key not found (set api_key)".to_string())
+        })?;
+        Ok(Self {
+            client: transport::build_client(config)?,
+            api_key,
+            base_url: config
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.moonshot.ai/v1".to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            request_builder: request::KimiRequestBuilder,
+            response_parser: OpenAiResponseParser,
+            context_compressor: OpenAiContextCompressor,
+            limiter: transport::RequestLimiter::from_config(config),
+        })
+    }
+
+    fn url(&self) -> String {
+        format!("{}/chat/completions", self.base_url)
+    }
+
+    fn headers(&self) -> Vec<transport::Header> {
+        vec![("Authorization", format!("Bearer {}", self.api_key))]
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for KimiProvider {
+    fn name(&self) -> &str {
+        "kimi"
+    }
+
+    fn request_builder(&self) -> &dyn RequestBuilder {
+        &self.request_builder
+    }
+
+    fn response_parser(&self) -> &dyn ResponseParser {
+        &self.response_parser
+    }
+
+    fn context_compressor(&self) -> &dyn ContextCompressor {
+        &self.context_compressor
+    }
+
+    async fn send_request(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        let _permit = self.limiter.acquire().await?;
+        transport::send_json_request(&self.client, self.url(), self.headers(), body).await
+    }
+
+    async fn generate_stream(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system_prompt: Option<&str>,
+        params: &GenerateParams,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamDelta>> + Send>>> {
+        let permit = self.limiter.acquire().await?;
+        let mut body =
+            self.request_builder
+                .build_request(model, messages, tools, system_prompt, params)?;
+        if let Some(object) = body.as_object_mut() {
+            object.insert("stream".into(), true.into());
+            object.insert(
+                "stream_options".into(),
+                serde_json::json!({"include_usage": true}),
+            );
+        }
+        let raw =
+            transport::send_sse_request(&self.client, self.url(), self.headers(), &body).await?;
+        Ok(transport::hold_permit(
+            transport::parse_sse_lines(raw, self.response_parser),
+            permit,
+        ))
+    }
+}

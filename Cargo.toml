@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "crates/deepcode-core",
+    "crates/deepcode-sandbox",
+    "crates/deepcode-tools",
+    "crates/deepcode-agent",
+    "crates/deepcode-permissions",
+    "crates/deepcode-providers",
+    "crates/deepcode-cli",
+]
+resolver = "2"
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+unused_crate_dependencies = "warn"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+schemars = "1"
+strum = { version = "0.27", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+directories = "6"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sha2 = "0.10"
+shlex = "1"
+url = "2"
