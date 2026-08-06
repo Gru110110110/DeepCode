@@ -154,6 +154,8 @@ pub async fn run(
     let mut model_config = model_config;
     let mut cmd_rx = cmd_rx;
     let mut state = AgentState::new(system_prompt, initial_messages);
+    llm.context_compressor()
+        .normalize_history(&mut state.messages);
     if !session_title_enabled {
         state.session_title_pending = false;
     }

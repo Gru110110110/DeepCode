@@ -200,6 +200,8 @@ async fn generate_plan(
         let assistant_blocks = response_blocks_to_content(&response_blocks);
         let tool_calls = tool_calls_from_blocks(&response_blocks);
         state.push_assistant(assistant_blocks);
+        llm.context_compressor()
+            .normalize_history(&mut state.messages);
         state.total_input_tokens += streamed.input_tokens;
         state.total_output_tokens += streamed.output_tokens;
         let _ = event_tx.send(AgentEvent::TurnComplete {

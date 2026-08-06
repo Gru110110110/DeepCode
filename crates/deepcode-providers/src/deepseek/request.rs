@@ -9,6 +9,8 @@ use deepcode_core::types::{Message, ToolDefinition};
 use crate::openai::responses_request::{build_responses_request, ResponsesOptions};
 use crate::openai_compat::{build_chat_completions_request, ChatCompletionsOptions};
 
+use super::history::chat_context_messages;
+
 pub(crate) struct DeepSeekRequestBuilder;
 pub(crate) struct DeepSeekResponsesRequestBuilder;
 
@@ -46,9 +48,10 @@ impl RequestBuilder for DeepSeekRequestBuilder {
         system_prompt: Option<&str>,
         params: &GenerateParams,
     ) -> Result<serde_json::Value> {
+        let messages = chat_context_messages(messages);
         let mut body = build_chat_completions_request(
             model,
-            messages,
+            messages.as_ref(),
             tools,
             system_prompt,
             params,
@@ -227,6 +230,31 @@ mod tests {
         assert_eq!(msg["reasoning_content"], "hidden chain");
         assert!(msg["content"].is_null());
         assert_eq!(msg["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn assistant_reasoning_is_omitted_without_tool_calls() {
+        let messages = vec![
+            Message::user("question"),
+            Message::assistant(vec![
+                ContentBlock::reasoning("hidden chain"),
+                ContentBlock::text("answer"),
+            ]),
+        ];
+
+        let body = DeepSeekRequestBuilder
+            .build_request(
+                "deepseek-test",
+                &messages,
+                &[],
+                None,
+                &GenerateParams::default(),
+            )
+            .unwrap();
+
+        let msg = &body["messages"][1];
+        assert_eq!(msg["content"], "answer");
+        assert!(msg.get("reasoning_content").is_none());
     }
 
     #[test]

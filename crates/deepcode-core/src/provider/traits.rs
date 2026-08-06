@@ -69,6 +69,9 @@ pub trait ContextCompressor: Send + Sync {
     /// real tokenizers (tiktoken, anthropic-tokenizer, etc.).
     fn estimate_tokens(&self, messages: &[Message]) -> usize;
 
+    /// Remove provider-specific response data that no longer needs to be replayed.
+    fn normalize_history(&self, _messages: &mut [Message]) {}
+
     /// Compress message history to fit within `target_tokens`.
     ///
     /// Called only when `needs_compression` returns true.

@@ -1,5 +1,6 @@
 // DeepSeek provider - OpenAI-compatible API with reasoning history support.
 pub(crate) mod compress;
+mod history;
 pub(crate) mod request;
 
 use deepcode_core::config::ProviderConfig;

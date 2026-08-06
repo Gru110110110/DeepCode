@@ -420,6 +420,8 @@ pub(crate) async fn execute_turn(
         });
 
         state.push_assistant(assistant_blocks);
+        llm.context_compressor()
+            .normalize_history(&mut state.messages);
         let _ = event_tx.send(AgentEvent::SessionUpdated {
             messages: state.messages.clone(),
         });
