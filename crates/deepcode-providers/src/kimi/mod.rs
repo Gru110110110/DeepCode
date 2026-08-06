@@ -13,6 +13,9 @@ use crate::openai::compress::OpenAiContextCompressor;
 use crate::openai::response::OpenAiResponseParser;
 use crate::transport;
 
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.kimi.com/coding/v1";
+pub(crate) const USER_AGENT: &str = concat!("deepcode/", env!("CARGO_PKG_VERSION"));
+
 pub(crate) struct KimiProvider {
     client: reqwest::Client,
     api_key: String,
@@ -34,7 +37,7 @@ impl KimiProvider {
             base_url: config
                 .base_url
                 .clone()
-                .unwrap_or_else(|| "https://api.moonshot.ai/v1".to_string())
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
                 .trim_end_matches('/')
                 .to_string(),
             request_builder: request::KimiRequestBuilder,
@@ -49,7 +52,10 @@ impl KimiProvider {
     }
 
     fn headers(&self) -> Vec<transport::Header> {
-        vec![("Authorization", format!("Bearer {}", self.api_key))]
+        vec![
+            ("Authorization", format!("Bearer {}", self.api_key)),
+            ("User-Agent", USER_AGENT.to_string()),
+        ]
     }
 }
 
@@ -101,5 +107,46 @@ impl LlmProvider for KimiProvider {
             transport::parse_sse_lines(raw, self.response_parser),
             permit,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(kind: &str) -> ProviderConfig {
+        ProviderConfig {
+            kind: kind.to_string(),
+            api_key: Some("secret".to_string()),
+            base_url: None,
+            max_concurrent_requests: None,
+            request_timeout_secs: None,
+            model: None,
+            reasoning_effort: None,
+            wire_api: None,
+            models: Default::default(),
+        }
+    }
+
+    #[test]
+    fn kimi_uses_code_endpoint_by_default() {
+        let provider = KimiProvider::new(&config("kimi")).unwrap();
+
+        assert_eq!(provider.name(), "kimi");
+        assert_eq!(provider.base_url, "https://api.kimi.com/coding/v1");
+        assert_eq!(
+            provider.url(),
+            "https://api.kimi.com/coding/v1/chat/completions"
+        );
+        assert_eq!(
+            provider.headers(),
+            vec![
+                ("Authorization", "Bearer secret".to_string()),
+                (
+                    "User-Agent",
+                    format!("deepcode/{}", env!("CARGO_PKG_VERSION"))
+                ),
+            ]
+        );
     }
 }

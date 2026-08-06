@@ -14,7 +14,7 @@ The project was born out of the need for an official programming agent for DeepS
 
 ## Features
 
-- **Provider support**: OpenAI, Anthropic, DeepSeek, Kimi/Moonshot, and Ollama.
+- **Provider support**: OpenAI, Anthropic, DeepSeek, Kimi Code, and Ollama.
 - **Provider-centric config**: a single configured provider is selected
   automatically; `active_provider` is required only when more than one provider
   is configured.
@@ -101,7 +101,11 @@ base_url = "http://localhost:11434"
 ```
 
 Supported provider types are `openai`, `anthropic`, `deepseek`, `kimi`, and
-`ollama`. Official OpenAI endpoints default to the Responses API. OpenAI-style
+`ollama`. The `kimi` provider accepts Kimi Code membership keys, defaults to
+`https://api.kimi.com/coding/v1`, and provides `k3`, `k3-256k`,
+`kimi-for-coding`, and `kimi-for-coding-highspeed`. Without an explicit model,
+the universally available `kimi-for-coding` is selected. Official OpenAI
+endpoints default to the Responses API. OpenAI-style
 gateways and DeepSeek default to Chat Completions; set `wire_api = "responses"`
 or `wire_api = "chat_completions"` inside an OpenAI or DeepSeek provider table
 to override that. In the current DeepSeek implementation, Responses API is only

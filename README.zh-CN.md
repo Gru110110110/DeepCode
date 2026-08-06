@@ -14,7 +14,7 @@
 
 ## 功能特性
 
-- **提供商支持**：OpenAI、Anthropic、DeepSeek、Kimi/Moonshot 和 Ollama。
+- **提供商支持**：OpenAI、Anthropic、DeepSeek、Kimi Code 和 Ollama。
 - **以提供商为中心的配置**：只配置一个提供商时会自动选中；只有配置多个提供商时才需要 `active_provider`。
 - **模型目录**：DeepCode 会从提供商 API 发现模型并缓存目录；发现不可用时回退到内置或配置的模型 profile；支持 `deepcode models` 和 `/model refresh`。
 - **交互式 TUI**：流式响应、Markdown 渲染、语法高亮、对话滚动、推理面板折叠/展开、文件变更预览、权限提示和会话选择器。
@@ -87,7 +87,7 @@ type = "ollama"
 base_url = "http://localhost:11434"
 ```
 
-当前支持的提供商类型是 `openai`、`anthropic`、`deepseek`、`kimi` 和 `ollama`。官方 OpenAI 端点默认使用 Responses API。OpenAI 风格网关和 DeepSeek 默认使用 Chat Completions；可以在 OpenAI 或 DeepSeek 提供商表中设置 `wire_api = "responses"` 或 `wire_api = "chat_completions"` 来覆盖。当前 DeepSeek 实现只接受 `deepseek-v4-flash` 使用 Responses API。
+当前支持的提供商类型是 `openai`、`anthropic`、`deepseek`、`kimi` 和 `ollama`。`kimi` 提供商使用 Kimi Code 会员密钥，默认连接 `https://api.kimi.com/coding/v1`，提供 `k3`、`k3-256k`、`kimi-for-coding` 和 `kimi-for-coding-highspeed`。未显式配置模型时，会选择所有会员均可用的 `kimi-for-coding`。官方 OpenAI 端点默认使用 Responses API。OpenAI 风格网关和 DeepSeek 默认使用 Chat Completions；可以在 OpenAI 或 DeepSeek 提供商表中设置 `wire_api = "responses"` 或 `wire_api = "chat_completions"` 来覆盖。当前 DeepSeek 实现只接受 `deepseek-v4-flash` 使用 Responses API。
 
 可选提供商字段示例：
 

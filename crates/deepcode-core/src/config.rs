@@ -860,4 +860,36 @@ mod tests {
         let config = DeepCodeConfig::parse(&source).unwrap();
         assert!(config.providers["later"].resolve_api_key().is_none());
     }
+
+    #[test]
+    fn kimi_provider_accepts_code_models() {
+        let source = r#"
+            [providers.membership]
+            type = "kimi"
+            api_key = "test-key"
+            model = "k3-256k"
+            reasoning_effort = "high"
+        "#;
+        let config = DeepCodeConfig::parse(source).unwrap();
+
+        assert_eq!(config.providers["membership"].kind, "kimi");
+        assert_eq!(
+            config.providers["membership"].model.as_deref(),
+            Some("k3-256k")
+        );
+    }
+
+    #[test]
+    fn kimi_code_alias_is_rejected() {
+        let error = DeepCodeConfig::parse(
+            r#"
+                [providers.membership]
+                type = "kimi-code"
+                api_key = "test-key"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unsupported type 'kimi-code'"));
+    }
 }

@@ -355,6 +355,9 @@ async fn discover_openai_style(
     if let Some(key) = config.resolve_api_key() {
         request = request.bearer_auth(key);
     }
+    if config.kind == "kimi" {
+        request = request.header("User-Agent", crate::kimi::USER_AGENT);
+    }
     if let Some(etag) = cached.and_then(|entry| entry.etag.as_deref()) {
         request = request.header("If-None-Match", etag);
     }
@@ -614,14 +617,16 @@ async fn discover_ollama(
 
 fn kimi_reasoning_efforts(model_id: &str, supports_reasoning: bool) -> Vec<ReasoningEffort> {
     match model_id {
-        "kimi-k3" => vec![
+        "k3" | "k3-256k" => vec![
             ReasoningEffort::Low,
             ReasoningEffort::High,
             ReasoningEffort::Max,
         ],
-        "kimi-k2.7-code" | "kimi-k2.7-code-highspeed" => vec![ReasoningEffort::High],
-        "kimi-k2.6" | "kimi-k2.5" => vec![ReasoningEffort::Off, ReasoningEffort::High],
-        _ if supports_reasoning => vec![ReasoningEffort::Off, ReasoningEffort::High],
+        "kimi-for-coding" | "kimi-for-coding-highspeed" => vec![ReasoningEffort::High],
+        // Unknown Kimi Code models cannot safely inherit the built-in request
+        // contract. Keep them usable with conservative non-reasoning defaults
+        // until their parameter mapping is explicitly supported.
+        _ if supports_reasoning => vec![ReasoningEffort::Off],
         _ => vec![ReasoningEffort::Off],
     }
 }
@@ -796,10 +801,17 @@ pub fn builtin_profiles(provider_name: &str, kind: &str) -> Vec<ModelProfile> {
         ],
         "kimi" => &[
             (
-                "kimi-k3",
+                "kimi-for-coding",
+                "Kimi K2.7 Code",
+                262_144,
+                32_768,
+                &[ReasoningEffort::High],
+            ),
+            (
+                "k3",
                 "Kimi K3",
-                2_097_152,
                 1_048_576,
+                131_072,
                 &[
                     ReasoningEffort::Low,
                     ReasoningEffort::High,
@@ -807,53 +819,22 @@ pub fn builtin_profiles(provider_name: &str, kind: &str) -> Vec<ModelProfile> {
                 ],
             ),
             (
-                "kimi-k2.7-code",
-                "Kimi K2.7 Code",
+                "k3-256k",
+                "Kimi K3 256K",
                 262_144,
-                32_768,
-                &[ReasoningEffort::High],
+                131_072,
+                &[
+                    ReasoningEffort::Low,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Max,
+                ],
             ),
             (
-                "kimi-k2.7-code-highspeed",
+                "kimi-for-coding-highspeed",
                 "Kimi K2.7 Code Highspeed",
                 262_144,
                 32_768,
                 &[ReasoningEffort::High],
-            ),
-            (
-                "kimi-k2.6",
-                "Kimi K2.6",
-                262_144,
-                96_000,
-                &[ReasoningEffort::Off, ReasoningEffort::High],
-            ),
-            (
-                "kimi-k2.5",
-                "Kimi K2.5",
-                262_144,
-                96_000,
-                &[ReasoningEffort::Off, ReasoningEffort::High],
-            ),
-            (
-                "moonshot-v1-8k",
-                "Moonshot V1 8K",
-                8_192,
-                4_096,
-                &[ReasoningEffort::Off],
-            ),
-            (
-                "moonshot-v1-32k",
-                "Moonshot V1 32K",
-                32_768,
-                8_192,
-                &[ReasoningEffort::Off],
-            ),
-            (
-                "moonshot-v1-128k",
-                "Moonshot V1 128K",
-                131_072,
-                8_192,
-                &[ReasoningEffort::Off],
             ),
         ],
         _ => &[],
@@ -875,7 +856,6 @@ pub fn recommended_effort(kind: &str, model: &ModelProfile) -> ReasoningEffort {
     let preferred = match kind {
         "openai" => ReasoningEffort::Medium,
         "anthropic" | "deepseek" => ReasoningEffort::High,
-        "kimi" if matches!(model.id.as_str(), "kimi-k3") => ReasoningEffort::Max,
         "kimi" => ReasoningEffort::High,
         "ollama" => ReasoningEffort::Medium,
         _ => ReasoningEffort::Off,
@@ -896,6 +876,11 @@ fn apply_overrides(
     config: &ProviderConfig,
     mut models: Vec<ModelProfile>,
 ) -> Vec<ModelProfile> {
+    if let Some(selected) = config.model.as_deref() {
+        if !models.iter().any(|model| model.id == selected) {
+            models.push(unknown_profile(provider_name, selected));
+        }
+    }
     for (id, override_config) in &config.models {
         let index = models.iter().position(|model| model.id == *id);
         if index.is_none() {
@@ -955,7 +940,7 @@ fn normalized_base_url(config: &ProviderConfig) -> String {
             "openai" => "https://api.openai.com/v1".to_string(),
             "anthropic" => "https://api.anthropic.com/v1".to_string(),
             "deepseek" => "https://api.deepseek.com".to_string(),
-            "kimi" => "https://api.moonshot.ai/v1".to_string(),
+            "kimi" => crate::kimi::DEFAULT_BASE_URL.to_string(),
             "ollama" => "http://localhost:11434".to_string(),
             _ => String::new(),
         })
@@ -1125,19 +1110,39 @@ mod tests {
     }
 
     #[test]
+    fn configured_model_is_kept_when_live_catalog_omits_it() {
+        let mut config = provider("kimi");
+        config.model = Some("private-kimi".to_string());
+        let catalog = apply_overrides("work", &config, builtin_profiles("work", "kimi"));
+        let model = catalog
+            .iter()
+            .find(|model| model.id == "private-kimi")
+            .unwrap();
+
+        assert_eq!(model.context_window, 32_768);
+        assert_eq!(model.max_output_tokens, 4_096);
+        assert_eq!(model.reasoning_efforts, vec![ReasoningEffort::Off]);
+    }
+
+    #[test]
     fn builtin_catalog_tracks_current_official_model_ids() {
         let anthropic = builtin_profiles("anthropic", "anthropic");
         assert!(anthropic.iter().any(|model| model.id == "claude-fable-5"));
         assert!(anthropic.iter().any(|model| model.id == "claude-opus-5"));
 
         let kimi = builtin_profiles("kimi", "kimi");
-        assert!(kimi.iter().any(|model| model.id == "kimi-k3"));
+        assert_eq!(kimi.len(), 4);
+        assert!(kimi.iter().any(|model| model.id == "k3"));
+        assert!(kimi.iter().any(|model| model.id == "k3-256k"));
+        assert!(kimi.iter().any(|model| model.id == "kimi-for-coding"));
         assert!(kimi
             .iter()
-            .any(|model| model.id == "kimi-k2.7-code-highspeed"));
-        assert!(kimi.iter().any(|model| model.id == "moonshot-v1-128k"));
-        assert!(!kimi.iter().any(|model| model.id == "k3"));
-        assert!(!kimi.iter().any(|model| model.id == "kimi-for-coding"));
+            .any(|model| model.id == "kimi-for-coding-highspeed"));
+        assert_eq!(kimi[0].id, "kimi-for-coding");
+        assert_eq!(kimi[0].context_window, 262_144);
+        let k3 = kimi.iter().find(|model| model.id == "k3").unwrap();
+        assert_eq!(k3.context_window, 1_048_576);
+        assert_eq!(recommended_effort("kimi", k3), ReasoningEffort::High);
     }
 
     #[test]
@@ -1222,6 +1227,11 @@ mod tests {
             let kind_owned = kind.to_string();
             let (base, server) = test_server(1, move |request| {
                 assert!(request.starts_with("GET /v1/models "));
+                if kind_owned == "kimi" {
+                    assert!(request
+                        .to_ascii_lowercase()
+                        .contains(&format!("user-agent: {}", crate::kimi::USER_AGENT)));
+                }
                 let row = if kind_owned == "kimi" {
                     serde_json::json!({
                         "id": "private-kimi",
@@ -1249,7 +1259,10 @@ mod tests {
             assert_eq!(discovered.etag.as_deref(), Some("catalog-v1"));
             if kind == "kimi" {
                 assert_eq!(discovered.models[0].context_window, 131072);
-                assert!(discovered.models[0].supports_effort(ReasoningEffort::High));
+                assert_eq!(
+                    discovered.models[0].reasoning_efforts,
+                    vec![ReasoningEffort::Off]
+                );
             } else {
                 assert_eq!(discovered.models[0].context_window, 32_768);
                 assert_eq!(

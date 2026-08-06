@@ -35,8 +35,10 @@ base_url = "https://api.deepseek.com"
 
 # [providers.kimi]
 # type = "kimi"
-# api_key = "your-api-key-here"
-# base_url = "https://api.moonshot.ai/v1"
+# api_key = "your-kimi-membership-key"
+# base_url = "https://api.kimi.com/coding/v1"
+# model = "k3-256k"
+# reasoning_effort = "high"
 
 # [providers.ollama]
 # type = "ollama"
