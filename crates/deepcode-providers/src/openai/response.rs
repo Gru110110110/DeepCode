@@ -67,7 +67,7 @@ impl ResponseParser for OpenAiResponseParser {
 
         // [DONE] marker
         if data == "[DONE]" {
-            return Ok(Some(StreamDelta::Finished(FinishReason::Stop)));
+            return Ok(None);
         }
 
         // Parse JSON
@@ -565,10 +565,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_stream_done_marker() {
+    fn parse_stream_ignores_done_marker() {
         let parser = OpenAiResponseParser;
-        let delta = parser.parse_stream_chunk("data: [DONE]").unwrap().unwrap();
-        assert!(matches!(delta, StreamDelta::Finished(FinishReason::Stop)));
+        assert!(parser.parse_stream_chunk("data: [DONE]").unwrap().is_none());
     }
 
     #[test]

@@ -48,6 +48,10 @@ impl StreamAccumulator {
                 None
             }
             StreamDelta::ProviderItem { provider, value } => {
+                // A completed provider item follows all deltas for that item.
+                // Flush the derived content first so streaming and non-streaming
+                // responses preserve the same content-block order.
+                self.queue_buffered_content();
                 self.pending_blocks
                     .push_back(ResponseContentBlock::ProviderItem { provider, value });
                 self.pending_blocks.pop_front()
@@ -309,6 +313,30 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(block, ResponseContentBlock::Text(t) if t == "before "));
+    }
+
+    #[test]
+    fn provider_item_follows_its_buffered_text() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(StreamDelta::TextDelta("answer".into()));
+
+        let first = acc
+            .process(StreamDelta::ProviderItem {
+                provider: "openai".into(),
+                value: serde_json::json!({
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "answer"}]
+                }),
+            })
+            .unwrap();
+        let second = acc.flush().unwrap();
+
+        assert!(matches!(first, ResponseContentBlock::Text(text) if text == "answer"));
+        assert!(matches!(
+            second,
+            ResponseContentBlock::ProviderItem { provider, value }
+                if provider == "openai" && value["type"] == "message"
+        ));
     }
 
     #[test]
