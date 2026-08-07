@@ -149,6 +149,8 @@ fn is_fixed_sampling(model: &str) -> bool {
 }
 
 fn kimi_k3_effort(effort: ReasoningEffort) -> &'static str {
+    // Keep this exhaustive and aligned with Kimi's documented aliases for
+    // defensive callers; normal validation handles Off before this mapping.
     match effort {
         ReasoningEffort::Off => "none",
         ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
@@ -292,9 +294,53 @@ mod tests {
     }
 
     #[test]
+    fn k3_supports_named_function_tool_choice() {
+        let params = GenerateParams {
+            tool_choice: Some(ToolChoice::Function("lookup".to_string())),
+            ..GenerateParams::default()
+        };
+        let tools = vec![ToolDefinition {
+            name: "lookup".to_string(),
+            description: "Lookup a value".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let body = KimiRequestBuilder
+            .build_request("k3", &[Message::user("hello")], &tools, None, &params)
+            .unwrap();
+
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["function"]["name"], "lookup");
+    }
+
+    #[test]
     fn coding_model_falls_back_from_required_to_auto() {
         let params = GenerateParams {
             tool_choice: Some(ToolChoice::Required),
+            unsupported_feature_policy: UnsupportedFeaturePolicy::AllowFallback,
+            ..GenerateParams::default()
+        };
+        let tools = vec![ToolDefinition {
+            name: "lookup".to_string(),
+            description: "Lookup a value".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let body = KimiRequestBuilder
+            .build_request(
+                "kimi-for-coding",
+                &[Message::user("hello")],
+                &tools,
+                None,
+                &params,
+            )
+            .unwrap();
+
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn coding_model_falls_back_from_named_function_to_auto() {
+        let params = GenerateParams {
+            tool_choice: Some(ToolChoice::Function("lookup".to_string())),
             unsupported_feature_policy: UnsupportedFeaturePolicy::AllowFallback,
             ..GenerateParams::default()
         };

@@ -411,13 +411,7 @@ async fn discover_openai_style(
             .min(context.saturating_sub(1).max(1));
         let efforts = builtin
             .map(|model| model.reasoning_efforts.clone())
-            .unwrap_or_else(|| {
-                if config.kind == "kimi" && row["supports_reasoning"].as_bool() == Some(true) {
-                    kimi_reasoning_efforts(id, true)
-                } else {
-                    vec![ReasoningEffort::Off]
-                }
-            });
+            .unwrap_or_else(|| vec![ReasoningEffort::Off]);
         models.push(ModelProfile {
             id: id.to_string(),
             provider: provider_name.to_string(),
@@ -613,22 +607,6 @@ async fn discover_ollama(
         last_modified: None,
         not_modified: false,
     })
-}
-
-fn kimi_reasoning_efforts(model_id: &str, supports_reasoning: bool) -> Vec<ReasoningEffort> {
-    match model_id {
-        "k3" | "k3-256k" => vec![
-            ReasoningEffort::Low,
-            ReasoningEffort::High,
-            ReasoningEffort::Max,
-        ],
-        "kimi-for-coding" | "kimi-for-coding-highspeed" => vec![ReasoningEffort::High],
-        // Unknown Kimi Code models cannot safely inherit the built-in request
-        // contract. Keep them usable with conservative non-reasoning defaults
-        // until their parameter mapping is explicitly supported.
-        _ if supports_reasoning => vec![ReasoningEffort::Off],
-        _ => vec![ReasoningEffort::Off],
-    }
 }
 
 pub fn builtin_profiles(provider_name: &str, kind: &str) -> Vec<ModelProfile> {
@@ -878,7 +856,11 @@ fn apply_overrides(
 ) -> Vec<ModelProfile> {
     if let Some(selected) = config.model.as_deref() {
         if !models.iter().any(|model| model.id == selected) {
-            models.push(unknown_profile(provider_name, selected));
+            let profile = builtin_profiles(provider_name, &config.kind)
+                .into_iter()
+                .find(|model| model.id == selected)
+                .unwrap_or_else(|| unknown_profile(provider_name, selected));
+            models.push(profile);
         }
     }
     for (id, override_config) in &config.models {
@@ -1110,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_model_is_kept_when_live_catalog_omits_it() {
+    fn configured_unknown_model_is_kept_when_live_catalog_omits_it() {
         let mut config = provider("kimi");
         config.model = Some("private-kimi".to_string());
         let catalog = apply_overrides("work", &config, builtin_profiles("work", "kimi"));
@@ -1122,6 +1104,29 @@ mod tests {
         assert_eq!(model.context_window, 32_768);
         assert_eq!(model.max_output_tokens, 4_096);
         assert_eq!(model.reasoning_efforts, vec![ReasoningEffort::Off]);
+    }
+
+    #[test]
+    fn configured_builtin_model_keeps_metadata_when_live_catalog_omits_it() {
+        let mut config = provider("kimi");
+        config.model = Some("k3".to_string());
+        let live_models = builtin_profiles("work", "kimi")
+            .into_iter()
+            .filter(|model| model.id != "k3")
+            .collect();
+        let catalog = apply_overrides("work", &config, live_models);
+        let model = catalog.iter().find(|model| model.id == "k3").unwrap();
+
+        assert_eq!(model.context_window, 1_048_576);
+        assert_eq!(model.max_output_tokens, 131_072);
+        assert_eq!(
+            model.reasoning_efforts,
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]
+        );
     }
 
     #[test]
