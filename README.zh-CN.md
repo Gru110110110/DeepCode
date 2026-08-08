@@ -98,9 +98,12 @@ api_key = "your-api-key-here"
 base_url = "https://api.deepseek.com"
 model = "deepseek-v4-flash"
 reasoning_effort = "high"
-request_timeout_secs = 300
+connect_timeout_secs = 30
+read_timeout_secs = 300
 max_concurrent_requests = 4
 ```
+
+`connect_timeout_secs` 只限制建立连接的时间。`read_timeout_secs` 限制连续未收到响应数据的时间，每次成功读取后都会重新计时；流式模型请求没有总时长上限。旧配置名 `request_timeout_secs` 仍作为 `read_timeout_secs` 的兼容别名接受。
 
 未知或私有模型可以覆盖保守的默认 profile：
 

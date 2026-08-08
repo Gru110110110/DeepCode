@@ -120,9 +120,16 @@ api_key = "your-api-key-here"
 base_url = "https://api.deepseek.com"
 model = "deepseek-v4-flash"
 reasoning_effort = "high"
-request_timeout_secs = 300
+connect_timeout_secs = 30
+read_timeout_secs = 300
 max_concurrent_requests = 4
 ```
+
+`connect_timeout_secs` only limits connection establishment. `read_timeout_secs`
+limits how long a response may remain idle and resets after every successful
+read; streaming model requests have no total duration limit. The legacy
+`request_timeout_secs` name is still accepted as an alias for
+`read_timeout_secs`.
 
 Unknown or private models can override the conservative default profile:
 

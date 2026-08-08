@@ -105,7 +105,9 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub max_concurrent_requests: Option<usize>,
-    pub request_timeout_secs: Option<u64>,
+    pub connect_timeout_secs: Option<u64>,
+    #[serde(alias = "request_timeout_secs")]
+    pub read_timeout_secs: Option<u64>,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub wire_api: Option<String>,
@@ -145,9 +147,15 @@ impl ProviderConfig {
                 name
             )));
         }
-        if self.request_timeout_secs == Some(0) {
+        if self.connect_timeout_secs == Some(0) {
             return Err(config_error(format!(
-                "Provider '{}' request_timeout_secs must be greater than zero",
+                "Provider '{}' connect_timeout_secs must be greater than zero",
+                name
+            )));
+        }
+        if self.read_timeout_secs == Some(0) {
+            return Err(config_error(format!(
+                "Provider '{}' read_timeout_secs must be greater than zero",
                 name
             )));
         }
@@ -759,6 +767,28 @@ mod tests {
         assert_eq!(name, "deepseek");
         assert_eq!(provider.model.as_deref(), Some("deepseek-v4-pro"));
         assert!(provider.models.contains_key("private-model"));
+    }
+
+    #[test]
+    fn provider_timeout_config_accepts_idle_and_connect_timeouts() {
+        let source = VALID.replace(
+            "reasoning_effort = \"high\"",
+            "reasoning_effort = \"high\"\n        connect_timeout_secs = 30\n        read_timeout_secs = 300",
+        );
+        let config = DeepCodeConfig::parse(&source).unwrap();
+        let provider = &config.providers["deepseek"];
+        assert_eq!(provider.connect_timeout_secs, Some(30));
+        assert_eq!(provider.read_timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn legacy_request_timeout_is_an_alias_for_read_timeout() {
+        let source = VALID.replace(
+            "reasoning_effort = \"high\"",
+            "reasoning_effort = \"high\"\n        request_timeout_secs = 300",
+        );
+        let config = DeepCodeConfig::parse(&source).unwrap();
+        assert_eq!(config.providers["deepseek"].read_timeout_secs, Some(300));
     }
 
     #[test]

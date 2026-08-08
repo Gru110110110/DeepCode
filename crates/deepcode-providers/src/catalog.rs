@@ -350,7 +350,7 @@ async fn discover_openai_style(
     config: &ProviderConfig,
     cached: Option<&CacheEntry>,
 ) -> std::result::Result<DiscoveryResult, DiscoveryFailure> {
-    let client = discovery_client(config)?;
+    let client = discovery_client()?;
     let mut request = client.get(format!("{}/models", normalized_base_url(config)));
     if let Some(key) = config.resolve_api_key() {
         request = request.bearer_auth(key);
@@ -437,7 +437,7 @@ async fn discover_anthropic(
     provider_name: &str,
     config: &ProviderConfig,
 ) -> std::result::Result<DiscoveryResult, DiscoveryFailure> {
-    let client = discovery_client(config)?;
+    let client = discovery_client()?;
     let mut after_id: Option<String> = None;
     let mut models = Vec::new();
     loop {
@@ -515,7 +515,7 @@ async fn discover_ollama(
     provider_name: &str,
     config: &ProviderConfig,
 ) -> std::result::Result<DiscoveryResult, DiscoveryFailure> {
-    let client = discovery_client(config)?;
+    let client = discovery_client()?;
     let root = normalized_base_url(config)
         .strip_suffix("/v1")
         .unwrap_or(&normalized_base_url(config))
@@ -930,13 +930,9 @@ fn normalized_base_url(config: &ProviderConfig) -> String {
         .to_string()
 }
 
-fn discovery_client(
-    config: &ProviderConfig,
-) -> std::result::Result<reqwest::Client, DiscoveryFailure> {
+fn discovery_client() -> std::result::Result<reqwest::Client, DiscoveryFailure> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(
-            config.request_timeout_secs.unwrap_or(10).min(10),
-        ))
+        .timeout(Duration::from_secs(10))
         .build()
         .map_err(http_failure)
 }
@@ -1059,7 +1055,8 @@ mod tests {
             api_key: Some("secret".to_string()),
             base_url: Some("https://example.test/v1/".to_string()),
             max_concurrent_requests: None,
-            request_timeout_secs: None,
+            connect_timeout_secs: None,
+            read_timeout_secs: None,
             model: None,
             reasoning_effort: None,
             wire_api: None,

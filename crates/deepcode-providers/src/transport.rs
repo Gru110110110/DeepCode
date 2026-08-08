@@ -10,6 +10,8 @@ use std::time::{Duration, SystemTime};
 
 const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RetryPolicy {
@@ -54,9 +56,18 @@ impl RequestLimiter {
 
 pub(crate) fn build_client(config: &ProviderConfig) -> Result<reqwest::Client> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(
-            config.request_timeout_secs.unwrap_or(300),
-        ))
+        .connect_timeout(
+            config
+                .connect_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+        )
+        .read_timeout(
+            config
+                .read_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_READ_TIMEOUT),
+        )
         .build()
         .map_err(|e| DeepCodeError::Http(format!("Failed to build HTTP client: {}", e)))
 }
@@ -272,8 +283,24 @@ fn provider_error_message(json: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn provider_config(read_timeout_secs: u64) -> ProviderConfig {
+        ProviderConfig {
+            kind: "ollama".to_string(),
+            api_key: None,
+            base_url: None,
+            max_concurrent_requests: None,
+            connect_timeout_secs: Some(1),
+            read_timeout_secs: Some(read_timeout_secs),
+            model: None,
+            reasoning_effort: None,
+            wire_api: None,
+            models: HashMap::new(),
+        }
+    }
 
     #[test]
     fn provider_error_message_accepts_object_string_and_message_shapes() {
@@ -459,6 +486,53 @@ mod tests {
         .unwrap();
 
         assert_eq!(response["ok"], true);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_request_can_outlive_read_timeout_while_data_keeps_arriving() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+
+            let chunks = (0..6)
+                .map(|index| format!("data: chunk-{index}\n\n"))
+                .collect::<Vec<_>>();
+            let content_length = chunks.iter().map(String::len).sum::<usize>();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+
+            for (index, chunk) in chunks.iter().enumerate() {
+                if index > 0 {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                socket.write_all(chunk.as_bytes()).await.unwrap();
+            }
+        });
+
+        let started = tokio::time::Instant::now();
+        let lines = send_sse_request(
+            &build_client(&provider_config(1)).unwrap(),
+            format!("http://{address}/stream"),
+            Vec::new(),
+            &serde_json::json!({"stream": true}),
+        )
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+        assert!(started.elapsed() > Duration::from_secs(1));
+        assert_eq!(lines.first().map(String::as_str), Some("data: chunk-0"));
+        assert!(lines.iter().any(|line| line == "data: chunk-5"));
         server.await.unwrap();
     }
 }

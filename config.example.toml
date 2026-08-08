@@ -14,6 +14,8 @@ base_url = "https://api.deepseek.com"
 # model = "deepseek-v4-flash"
 # reasoning_effort = "high"
 # wire_api = "responses" # optional: explicitly opt in to Responses API
+# connect_timeout_secs = 30
+# read_timeout_secs = 300 # maximum idle time between response chunks; no total request deadline
 
 # Unknown/private models can override the conservative 32K/4K/off defaults.
 # [providers.deepseek.models."private-model"]
