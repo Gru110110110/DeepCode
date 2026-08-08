@@ -12,15 +12,19 @@ pub(crate) struct AnthropicRequestBuilder;
 impl RequestBuilder for AnthropicRequestBuilder {
     fn capabilities(&self, model: &str) -> ProviderCapabilities {
         let supports_reasoning = !model.starts_with("claude-haiku-4-5");
+        let fixed_sampling = uses_fixed_sampling(model);
         ProviderCapabilities {
             provider: "anthropic",
-            temperature: true,
-            top_p: true,
+            temperature: !fixed_sampling,
+            top_p: !fixed_sampling,
             stop_sequences: true,
             reasoning_effort: supports_reasoning,
             reasoning_efforts: anthropic_efforts(model),
+            reasoning_can_disable: thinking_can_disable(model),
             reasoning_display: supports_reasoning,
             tool_choice: true,
+            prompt_cache_key: true,
+            prompt_cache_retention: true,
             image_input: true,
             file_input: true,
             provider_item_replay: true,
@@ -39,9 +43,10 @@ impl RequestBuilder for AnthropicRequestBuilder {
     ) -> Result<serde_json::Value> {
         self.capabilities(model)
             .validate_request(messages, params)?;
-        if params
+        let thinking_enabled = params
             .reasoning_effort
-            .is_some_and(|effort| effort != ReasoningEffort::Off)
+            .is_some_and(|effort| effort != ReasoningEffort::Off);
+        if thinking_enabled
             && params.temperature.is_some()
             && params.unsupported_feature_policy == UnsupportedFeaturePolicy::Error
         {
@@ -49,6 +54,27 @@ impl RequestBuilder for AnthropicRequestBuilder {
                 provider: "anthropic".to_string(),
                 feature: "temperature_with_adaptive_thinking".to_string(),
             });
+        }
+        if thinking_enabled
+            && params
+                .top_p
+                .is_some_and(|top_p| !(0.95..=1.0).contains(&top_p))
+            && params.unsupported_feature_policy == UnsupportedFeaturePolicy::Error
+        {
+            return Err(deepcode_core::error::DeepCodeError::UnsupportedFeature {
+                provider: "anthropic".to_string(),
+                feature: "top_p_with_adaptive_thinking".to_string(),
+            });
+        }
+        if let Some(retention) = params.prompt_cache_retention.as_deref() {
+            if !matches!(retention, "5m" | "1h")
+                && params.unsupported_feature_policy == UnsupportedFeaturePolicy::Error
+            {
+                return Err(deepcode_core::error::DeepCodeError::UnsupportedFeature {
+                    provider: "anthropic".to_string(),
+                    feature: format!("prompt_cache_retention:{retention}"),
+                });
+            }
         }
         let mut body = serde_json::Map::new();
         body.insert("model".into(), model.into());
@@ -233,17 +259,40 @@ impl RequestBuilder for AnthropicRequestBuilder {
                 thinking["display"] = display.as_str().into();
             }
             body.insert("thinking".into(), thinking);
-        } else if let Some(temp) = params.temperature {
-            body.insert("temperature".into(), temp.into());
+        } else {
+            if params.reasoning_effort == Some(ReasoningEffort::Off)
+                && needs_explicit_thinking_disable(model)
+            {
+                body.insert("thinking".into(), serde_json::json!({"type": "disabled"}));
+            }
+            if !uses_fixed_sampling(model) {
+                if let Some(temp) = params.temperature {
+                    body.insert("temperature".into(), temp.into());
+                }
+            }
         }
-        if let Some(top_p) = params.top_p {
-            body.insert("top_p".into(), top_p.into());
+        if !uses_fixed_sampling(model) {
+            if let Some(top_p) = params
+                .top_p
+                .filter(|top_p| !thinking_enabled || (0.95..=1.0).contains(top_p))
+            {
+                body.insert("top_p".into(), top_p.into());
+            }
         }
         if !params.stop_sequences.is_empty() {
             body.insert(
                 "stop_sequences".into(),
                 params.stop_sequences.clone().into(),
             );
+        }
+        if params.prompt_cache_key.is_some() || params.prompt_cache_retention.is_some() {
+            // Anthropic automatic prompt caching has no client-provided key. The
+            // shared key field acts as the provider-neutral opt-in signal.
+            let mut cache_control = serde_json::json!({"type": "ephemeral"});
+            if let Some(retention @ ("5m" | "1h")) = params.prompt_cache_retention.as_deref() {
+                cache_control["ttl"] = retention.into();
+            }
+            body.insert("cache_control".into(), cache_control);
         }
         if let Some(options) = params
             .provider_options
@@ -260,7 +309,7 @@ impl RequestBuilder for AnthropicRequestBuilder {
 }
 
 fn anthropic_efforts(model: &str) -> &'static [ReasoningEffort] {
-    if model.starts_with("claude-sonnet-4-6") {
+    if model.starts_with("claude-sonnet-4-6") || model.starts_with("claude-opus-4-6") {
         &[
             ReasoningEffort::Low,
             ReasoningEffort::Medium,
@@ -278,6 +327,36 @@ fn anthropic_efforts(model: &str) -> &'static [ReasoningEffort] {
             ReasoningEffort::Max,
         ]
     }
+}
+
+fn uses_fixed_sampling(model: &str) -> bool {
+    [
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-mythos-preview",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-sonnet-5",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
+}
+
+fn thinking_can_disable(model: &str) -> bool {
+    needs_explicit_thinking_disable(model)
+        || [
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        ]
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+}
+
+fn needs_explicit_thinking_disable(model: &str) -> bool {
+    model.starts_with("claude-opus-5") || model.starts_with("claude-sonnet-5")
 }
 
 fn anthropic_tool_choice(choice: &ToolChoice) -> serde_json::Value {
@@ -472,5 +551,166 @@ mod tests {
         let thinking = &body["messages"][0]["content"][0];
         assert_eq!(thinking["thinking"], "complete thinking");
         assert_eq!(thinking["signature"], "sig");
+    }
+
+    #[test]
+    fn redacted_thinking_block_is_replayed_unchanged() {
+        let redacted = serde_json::json!({
+            "type": "redacted_thinking",
+            "data": "opaque"
+        });
+        let body = AnthropicRequestBuilder
+            .build_request(
+                "claude-sonnet-4-6",
+                &[Message::assistant(vec![
+                    ContentBlock::reasoning_with_metadata(
+                        "",
+                        serde_json::json!({
+                            "provider": "anthropic",
+                            "block": redacted.clone()
+                        }),
+                    ),
+                    ContentBlock::text("answer"),
+                ])],
+                &[],
+                None,
+                &GenerateParams::default(),
+            )
+            .unwrap();
+
+        assert_eq!(body["messages"][0]["content"][0], redacted);
+    }
+
+    #[test]
+    fn fixed_sampling_models_reject_sampling_parameters() {
+        let capabilities = AnthropicRequestBuilder.capabilities("claude-opus-4-8");
+        assert!(!capabilities.temperature);
+        assert!(!capabilities.top_p);
+
+        let params = GenerateParams {
+            top_p: Some(0.9),
+            ..GenerateParams::default()
+        };
+        assert!(AnthropicRequestBuilder
+            .build_request(
+                "claude-opus-4-8",
+                &[Message::user("hi")],
+                &[],
+                None,
+                &params,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn fallback_drops_sampling_parameters_on_fixed_sampling_models() {
+        let params = GenerateParams {
+            temperature: Some(0.4),
+            top_p: Some(0.8),
+            unsupported_feature_policy: UnsupportedFeaturePolicy::AllowFallback,
+            ..GenerateParams::default()
+        };
+        let body = AnthropicRequestBuilder
+            .build_request(
+                "claude-opus-4-8",
+                &[Message::user("hi")],
+                &[],
+                None,
+                &params,
+            )
+            .unwrap();
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
+    fn adaptive_thinking_only_accepts_supported_top_p_range() {
+        let accepted = GenerateParams {
+            reasoning_effort: Some(ReasoningEffort::High),
+            top_p: Some(0.95),
+            ..GenerateParams::default()
+        };
+        let body = AnthropicRequestBuilder
+            .build_request(
+                "claude-sonnet-4-6",
+                &[Message::user("hi")],
+                &[],
+                None,
+                &accepted,
+            )
+            .unwrap();
+        assert!(
+            (body["top_p"].as_f64().unwrap() - 0.95).abs() < 1e-6,
+            "serialized top_p should retain the configured value"
+        );
+
+        let rejected = GenerateParams {
+            top_p: Some(0.9),
+            ..accepted
+        };
+        assert!(AnthropicRequestBuilder
+            .build_request(
+                "claude-sonnet-4-6",
+                &[Message::user("hi")],
+                &[],
+                None,
+                &rejected,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn opus_4_6_does_not_advertise_xhigh_effort() {
+        let capabilities = AnthropicRequestBuilder.capabilities("claude-opus-4-6");
+        assert!(!capabilities
+            .reasoning_efforts
+            .contains(&ReasoningEffort::Xhigh));
+        assert!(capabilities
+            .reasoning_efforts
+            .contains(&ReasoningEffort::Max));
+    }
+
+    #[test]
+    fn prompt_cache_opt_in_uses_anthropic_cache_control() {
+        let params = GenerateParams {
+            prompt_cache_key: Some("conversation-1".to_string()),
+            prompt_cache_retention: Some("1h".to_string()),
+            ..GenerateParams::default()
+        };
+        let body = AnthropicRequestBuilder
+            .build_request(
+                "claude-sonnet-4-6",
+                &[Message::user("hi")],
+                &[],
+                None,
+                &params,
+            )
+            .unwrap();
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["cache_control"]["ttl"], "1h");
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn reasoning_off_uses_the_models_supported_disable_shape() {
+        let params = GenerateParams {
+            reasoning_effort: Some(ReasoningEffort::Off),
+            ..GenerateParams::default()
+        };
+        let opus_5 = AnthropicRequestBuilder
+            .build_request("claude-opus-5", &[Message::user("hi")], &[], None, &params)
+            .unwrap();
+        assert_eq!(opus_5["thinking"]["type"], "disabled");
+
+        let opus_4_8 = AnthropicRequestBuilder
+            .build_request(
+                "claude-opus-4-8",
+                &[Message::user("hi")],
+                &[],
+                None,
+                &params,
+            )
+            .unwrap();
+        assert!(opus_4_8.get("thinking").is_none());
     }
 }

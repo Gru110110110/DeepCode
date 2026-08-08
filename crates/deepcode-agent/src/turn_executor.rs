@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use deepcode_core::provider::traits::{
-    GenerateParams, LlmProvider, ReasoningContext, ReasoningDisplay, ReasoningSummary,
-    TextVerbosity,
+    FinishReason, GenerateParams, LlmProvider, ReasoningContext, ReasoningDisplay,
+    ReasoningSummary, TextVerbosity,
 };
 use deepcode_core::types::{ContentBlock, Message, Role};
 use deepcode_permissions::execpolicy::Decision;
@@ -402,10 +402,8 @@ pub(crate) async fn execute_turn(
             };
 
         // 4. Separate tool calls from text
+        let finish_reason = streamed.finish_reason.clone();
         let response_blocks = streamed.response_blocks;
-        if streamed.session_title_resolved {
-            state.session_title_pending = false;
-        }
         let assistant_blocks = response_blocks_to_content(&response_blocks);
         let tool_calls = tool_calls_from_blocks(&response_blocks);
 
@@ -419,6 +417,18 @@ pub(crate) async fn execute_turn(
             reasoning_output_tokens: streamed.reasoning_output_tokens,
         });
 
+        if finish_reason == Some(FinishReason::ContentFilter) {
+            let _ = event_tx.send(AgentEvent::AgentError {
+                message: "The model refused the request; try another model or revise the request."
+                    .to_string(),
+            });
+            state.phase = AgentPhase::Error;
+            break;
+        }
+
+        if streamed.session_title_resolved {
+            state.session_title_pending = false;
+        }
         state.push_assistant(assistant_blocks);
         llm.context_compressor()
             .normalize_history(&mut state.messages);

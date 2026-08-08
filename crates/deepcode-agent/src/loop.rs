@@ -360,6 +360,7 @@ mod tests {
     struct ToolLoopProvider {
         calls: AtomicUsize,
         pending_stream: bool,
+        refusal: bool,
         tool_calls: Vec<(String, String, String)>,
         request_builder: TestRequestBuilder,
         response_parser: TestResponseParser,
@@ -383,6 +384,7 @@ mod tests {
             Self {
                 calls: AtomicUsize::new(0),
                 pending_stream: false,
+                refusal: false,
                 tool_calls: tool_calls
                     .into_iter()
                     .map(|(id, name, input_delta)| {
@@ -398,6 +400,12 @@ mod tests {
         fn pending() -> Self {
             let mut provider = Self::new();
             provider.pending_stream = true;
+            provider
+        }
+
+        fn refusal() -> Self {
+            let mut provider = Self::new();
+            provider.refusal = true;
             provider
         }
 
@@ -435,6 +443,24 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.pending_stream {
                 return Ok(Box::pin(stream::pending()));
+            }
+            if self.refusal {
+                return Ok(Box::pin(stream::iter(
+                    vec![
+                        StreamDelta::TextDelta("I cannot help with that.".to_string()),
+                        StreamDelta::Usage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                            cached_input_tokens: 0,
+                            cache_miss_input_tokens: 0,
+                            reasoning_output_tokens: 0,
+                        },
+                        StreamDelta::Finished(FinishReason::ContentFilter),
+                        StreamDelta::Finished(FinishReason::Stop),
+                    ]
+                    .into_iter()
+                    .map(Ok),
+                )));
             }
             let has_tool_result = messages.iter().any(|m| matches!(m.role, Role::Tool));
             let deltas = if has_tool_result {
@@ -726,6 +752,34 @@ mod tests {
 
     async fn run_test_agent() -> Vec<AgentEvent> {
         run_test_agent_with_provider(Arc::new(ToolLoopProvider::new()), false).await
+    }
+
+    #[tokio::test]
+    async fn refusal_is_reported_without_persisting_assistant_content() {
+        let events =
+            run_test_agent_with_provider(Arc::new(ToolLoopProvider::refusal()), false).await;
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AgentError { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AgentFinished { .. })));
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::TextDelta(text) if text.contains("cannot help"))
+        ));
+
+        let latest_messages = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::SessionUpdated { messages } => Some(messages),
+                _ => None,
+            })
+            .next_back()
+            .expect("the user message should update the session");
+        assert!(latest_messages
+            .iter()
+            .all(|message| message.role != Role::Assistant));
     }
 
     async fn run_agent_with_registry(

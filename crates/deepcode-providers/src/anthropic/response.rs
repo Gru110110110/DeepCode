@@ -50,12 +50,7 @@ impl ResponseParser for AnthropicResponseParser {
             }
         }
 
-        let finish_reason = match raw["stop_reason"].as_str() {
-            Some("end_turn") => FinishReason::Stop,
-            Some("tool_use") => FinishReason::ToolCalls,
-            Some("max_tokens") => FinishReason::Length,
-            _ => FinishReason::Stop,
-        };
+        let finish_reason = map_finish_reason(raw["stop_reason"].as_str());
 
         let usage = raw.get("usage").map_or(Usage::default(), anthropic_usage);
 
@@ -206,7 +201,8 @@ fn anthropic_usage(usage: &serde_json::Value) -> Usage {
 fn map_finish_reason(reason: Option<&str>) -> FinishReason {
     match reason {
         Some("tool_use") => FinishReason::ToolCalls,
-        Some("max_tokens") => FinishReason::Length,
+        Some("max_tokens") | Some("model_context_window_exceeded") => FinishReason::Length,
+        Some("refusal") => FinishReason::ContentFilter,
         _ => FinishReason::Stop,
     }
 }
@@ -328,6 +324,29 @@ mod tests {
         let line = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#;
         let delta = parser.parse_stream_chunk(line).unwrap().unwrap();
         assert!(matches!(delta, StreamDelta::Finished(FinishReason::Stop)));
+    }
+
+    #[test]
+    fn refusal_is_preserved_as_content_filter_finish_reason() {
+        let parser = AnthropicResponseParser;
+        let response = parser
+            .parse_response(&serde_json::json!({
+                "content": [{"type": "text", "text": "I cannot help with that."}],
+                "stop_reason": "refusal"
+            }))
+            .unwrap();
+        assert_eq!(response.finish_reason, FinishReason::ContentFilter);
+
+        let delta = parser
+            .parse_stream_chunk(
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal"}}"#,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            delta,
+            StreamDelta::Finished(FinishReason::ContentFilter)
+        ));
     }
 
     #[test]

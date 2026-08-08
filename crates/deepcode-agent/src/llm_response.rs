@@ -1,7 +1,7 @@
 use std::pin::Pin;
 
 use deepcode_core::error::Result as CoreResult;
-use deepcode_core::provider::traits::{ResponseContentBlock, StreamDelta};
+use deepcode_core::provider::traits::{FinishReason, ResponseContentBlock, StreamDelta};
 use deepcode_core::types::ContentBlock;
 use futures::{Stream, StreamExt};
 
@@ -19,6 +19,7 @@ pub(crate) type ToolCall = (String, String, serde_json::Value);
 
 pub(crate) struct StreamedResponse {
     pub response_blocks: Vec<ResponseContentBlock>,
+    pub finish_reason: Option<FinishReason>,
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub cached_input_tokens: usize,
@@ -48,6 +49,7 @@ pub(crate) async fn collect_stream_response(
     let mut cached_input_tokens = 0usize;
     let mut cache_miss_input_tokens = 0usize;
     let mut reasoning_output_tokens = 0usize;
+    let mut finish_reason = None;
 
     loop {
         let delta_result = tokio::select! {
@@ -99,6 +101,9 @@ pub(crate) async fn collect_stream_response(
                         }
                         other => other,
                     };
+                    if let StreamDelta::Finished(reason) = &delta {
+                        preserve_finish_reason(&mut finish_reason, reason.clone());
+                    }
                     if let Some(block) = accumulator.process(delta) {
                         response_blocks.push(block);
                     }
@@ -132,6 +137,7 @@ pub(crate) async fn collect_stream_response(
 
     StreamResponseOutcome::Completed(StreamedResponse {
         response_blocks,
+        finish_reason,
         input_tokens,
         output_tokens,
         cached_input_tokens,
@@ -139,6 +145,16 @@ pub(crate) async fn collect_stream_response(
         reasoning_output_tokens,
         session_title_resolved: !capture_session_title || title_filter.decided,
     })
+}
+
+fn preserve_finish_reason(current: &mut Option<FinishReason>, incoming: FinishReason) {
+    if current
+        .as_ref()
+        .is_some_and(|reason| *reason != FinishReason::Stop && incoming == FinishReason::Stop)
+    {
+        return;
+    }
+    *current = Some(incoming);
 }
 
 fn flatten_delta(delta: StreamDelta) -> Vec<StreamDelta> {
@@ -287,6 +303,23 @@ mod tests {
             event_rx.try_recv(),
             Ok(AgentEvent::TextDelta(text)) if text == "done"
         ));
+    }
+
+    #[tokio::test]
+    async fn content_filter_finish_reason_survives_trailing_stop_event() {
+        let stream: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamDelta::TextDelta("refused".to_string())),
+            Ok(StreamDelta::Finished(FinishReason::ContentFilter)),
+            Ok(StreamDelta::Finished(FinishReason::Stop)),
+        ]));
+        let (_cmd_tx, mut cmd_rx) = event::cmd_channel(1);
+        let (event_tx, _event_rx) = event::event_channel();
+
+        let result = collect_stream_response(stream, &mut cmd_rx, &event_tx, false).await;
+        let StreamResponseOutcome::Completed(response) = result else {
+            panic!("expected completed response");
+        };
+        assert_eq!(response.finish_reason, Some(FinishReason::ContentFilter));
     }
 
     #[tokio::test]

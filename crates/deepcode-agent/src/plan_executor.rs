@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use deepcode_core::provider::traits::{
-    GenerateParams, LlmProvider, ReasoningContext, ReasoningDisplay, ReasoningSummary,
-    TextVerbosity,
+    FinishReason, GenerateParams, LlmProvider, ReasoningContext, ReasoningDisplay,
+    ReasoningSummary, TextVerbosity,
 };
 use deepcode_tools::registry::ToolRegistry;
 
@@ -196,12 +196,10 @@ async fn generate_plan(
             }
         };
 
+        let finish_reason = streamed.finish_reason.clone();
         let response_blocks = streamed.response_blocks;
         let assistant_blocks = response_blocks_to_content(&response_blocks);
         let tool_calls = tool_calls_from_blocks(&response_blocks);
-        state.push_assistant(assistant_blocks);
-        llm.context_compressor()
-            .normalize_history(&mut state.messages);
         state.total_input_tokens += streamed.input_tokens;
         state.total_output_tokens += streamed.output_tokens;
         let _ = event_tx.send(AgentEvent::TurnComplete {
@@ -211,6 +209,19 @@ async fn generate_plan(
             cache_miss_input_tokens: streamed.cache_miss_input_tokens,
             reasoning_output_tokens: streamed.reasoning_output_tokens,
         });
+
+        if finish_reason == Some(FinishReason::ContentFilter) {
+            let _ = event_tx.send(AgentEvent::AgentError {
+                message: "The model refused the request; try another model or revise the request."
+                    .to_string(),
+            });
+            state.phase = AgentPhase::Error;
+            return PlanGeneration::Failed;
+        }
+
+        state.push_assistant(assistant_blocks);
+        llm.context_compressor()
+            .normalize_history(&mut state.messages);
         let _ = event_tx.send(AgentEvent::SessionUpdated {
             messages: state.messages.clone(),
         });

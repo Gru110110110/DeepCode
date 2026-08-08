@@ -53,11 +53,27 @@ impl AnthropicProvider {
         format!("{}/messages", self.base_url)
     }
 
-    fn headers(&self) -> Vec<transport::Header> {
-        vec![
+    fn headers(&self, body: &serde_json::Value) -> Vec<transport::Header> {
+        let mut headers = vec![
             ("x-api-key", self.api_key.clone()),
             ("anthropic-version", self.anthropic_version.clone()),
-        ]
+        ];
+        if contains_file_source(body) {
+            headers.push(("anthropic-beta", "files-api-2025-04-14".to_string()));
+        }
+        headers
+    }
+}
+
+fn contains_file_source(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            (object.get("type").and_then(serde_json::Value::as_str) == Some("file")
+                && object.contains_key("file_id"))
+                || object.values().any(contains_file_source)
+        }
+        serde_json::Value::Array(values) => values.iter().any(contains_file_source),
+        _ => false,
     }
 }
 
@@ -81,7 +97,14 @@ impl LlmProvider for AnthropicProvider {
 
     async fn send_request(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
         let _permit = self.limiter.acquire().await?;
-        transport::send_json_request(&self.client, self.messages_url(), self.headers(), body).await
+        transport::send_json_request_with_retry(
+            &self.client,
+            self.messages_url(),
+            self.headers(body),
+            body,
+            transport::RetryPolicy::new(2),
+        )
+        .await
     }
 
     async fn generate_stream(
@@ -100,12 +123,37 @@ impl LlmProvider for AnthropicProvider {
             obj.insert("stream".into(), true.into());
         }
 
-        let raw_stream =
-            transport::send_sse_request(&self.client, self.messages_url(), self.headers(), &body)
-                .await?;
+        let raw_stream = transport::send_sse_request_with_retry(
+            &self.client,
+            self.messages_url(),
+            self.headers(&body),
+            &body,
+            transport::RetryPolicy::new(2),
+        )
+        .await?;
         Ok(transport::hold_permit(
             transport::parse_sse_lines(raw_stream, self.response_parser),
             permit,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_files_api_sources_without_matching_unrelated_file_blocks() {
+        assert!(contains_file_source(&serde_json::json!({
+            "messages": [{
+                "content": [{
+                    "type": "image",
+                    "source": {"type": "file", "file_id": "file_123"}
+                }]
+            }]
+        })));
+        assert!(!contains_file_source(&serde_json::json!({
+            "messages": [{"content": [{"type": "file", "name": "notes.txt"}]}]
+        })));
     }
 }
