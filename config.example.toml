@@ -11,9 +11,9 @@ base_url = "https://api.deepseek.com"
 
 # Optional selection overrides. By default DeepCode selects a recommended
 # tool-capable model and effort from the discovered catalog.
-# model = "deepseek-v4-flash"
+# model = "deepseek-v4-pro"
 # reasoning_effort = "high"
-# wire_api = "responses" # optional: explicitly opt in to Responses API
+# wire_api = "responses" # explicit opt-in; DeepSeek validates model compatibility
 # connect_timeout_secs = 30
 # read_timeout_secs = 300 # maximum idle time between response chunks; no total request deadline
 

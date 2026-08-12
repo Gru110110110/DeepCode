@@ -374,4 +374,20 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "max");
         assert!(body["reasoning"].get("summary").is_none());
     }
+
+    #[test]
+    fn responses_builds_v4_pro_requests() {
+        let body = DeepSeekResponsesRequestBuilder
+            .build_request(
+                "deepseek-v4-pro",
+                &[Message::user("hello")],
+                &[],
+                None,
+                &GenerateParams::default(),
+            )
+            .unwrap();
+
+        assert_eq!(body["model"], "deepseek-v4-pro");
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
 }

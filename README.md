@@ -108,8 +108,10 @@ the universally available `kimi-for-coding` is selected. Official OpenAI
 endpoints default to the Responses API. OpenAI-style
 gateways and DeepSeek default to Chat Completions; set `wire_api = "responses"`
 or `wire_api = "chat_completions"` inside an OpenAI or DeepSeek provider table
-to override that. In the current DeepSeek implementation, Responses API is only
-accepted for `deepseek-v4-flash`.
+to override that. The [DeepSeek Responses API documentation](https://api-docs.deepseek.com/guides/responses_api)
+currently lists `deepseek-v4-flash` and `deepseek-v4-pro`. DeepCode does not
+maintain a separate model allowlist: when Responses API is explicitly selected,
+DeepSeek validates whether the configured model supports it.
 
 Optional provider fields include:
 
@@ -118,8 +120,9 @@ Optional provider fields include:
 type = "deepseek"
 api_key = "your-api-key-here"
 base_url = "https://api.deepseek.com"
-model = "deepseek-v4-flash"
+model = "deepseek-v4-pro"
 reasoning_effort = "high"
+wire_api = "responses"
 connect_timeout_secs = 30
 read_timeout_secs = 300
 max_concurrent_requests = 4

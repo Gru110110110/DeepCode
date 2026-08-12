@@ -90,15 +90,12 @@ impl DeepSeekProvider {
         }
     }
 
-    fn wire_api_for_model(&self, model: &str) -> Result<WireApi> {
+    fn wire_api(&self) -> WireApi {
+        // `wire_api` is an explicit protocol choice. Model compatibility changes over
+        // time, so let DeepSeek's API provide the authoritative validation.
         match self.wire_api {
-            DeepSeekWireApi::ChatCompletions => Ok(WireApi::ChatCompletions),
-            DeepSeekWireApi::Responses if supports_responses_api(model) => Ok(WireApi::Responses),
-            DeepSeekWireApi::Responses => Err(DeepCodeError::Config(format!(
-                "DeepSeek Responses API currently supports deepseek-v4-flash only; model '{}' should use wire_api = \"chat_completions\"",
-                model
-            ))),
-            DeepSeekWireApi::Auto => Ok(WireApi::ChatCompletions),
+            DeepSeekWireApi::ChatCompletions | DeepSeekWireApi::Auto => WireApi::ChatCompletions,
+            DeepSeekWireApi::Responses => WireApi::Responses,
         }
     }
 
@@ -123,10 +120,6 @@ impl DeepSeekProvider {
     }
 }
 
-fn supports_responses_api(model: &str) -> bool {
-    model == "deepseek-v4-flash"
-}
-
 #[async_trait::async_trait]
 impl LlmProvider for DeepSeekProvider {
     fn name(&self) -> &str {
@@ -138,9 +131,9 @@ impl LlmProvider for DeepSeekProvider {
     }
 
     fn capabilities(&self, model: &str) -> ProviderCapabilities {
-        match self.wire_api_for_model(model) {
-            Ok(WireApi::Responses) => self.responses_request_builder.capabilities(model),
-            _ => self.request_builder.capabilities(model),
+        match self.wire_api() {
+            WireApi::Responses => self.responses_request_builder.capabilities(model),
+            WireApi::ChatCompletions => self.request_builder.capabilities(model),
         }
     }
 
@@ -160,7 +153,7 @@ impl LlmProvider for DeepSeekProvider {
         system_prompt: Option<&str>,
         params: &GenerateParams,
     ) -> Result<GenerateResponse> {
-        let wire_api = self.wire_api_for_model(model)?;
+        let wire_api = self.wire_api();
         let (body, parser): (serde_json::Value, &dyn ResponseParser) = match wire_api {
             WireApi::ChatCompletions => (
                 self.request_builder.build_request(
@@ -200,7 +193,7 @@ impl LlmProvider for DeepSeekProvider {
         params: &GenerateParams,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamDelta>> + Send>>> {
         let permit = self.limiter.acquire().await?;
-        let wire_api = self.wire_api_for_model(model)?;
+        let wire_api = self.wire_api();
         let mut body = match wire_api {
             WireApi::ChatCompletions => {
                 self.request_builder
@@ -266,39 +259,22 @@ mod tests {
     }
 
     #[test]
-    fn flash_defaults_to_chat_completions_api() {
+    fn defaults_to_chat_completions_api() {
         let provider = deepseek_provider(None);
-        assert!(matches!(
-            provider.wire_api_for_model("deepseek-v4-flash").unwrap(),
-            WireApi::ChatCompletions
-        ));
-        assert!(matches!(
-            provider.wire_api_for_model("deepseek-v4-pro").unwrap(),
-            WireApi::ChatCompletions
-        ));
+        assert!(matches!(provider.wire_api(), WireApi::ChatCompletions));
     }
 
     #[test]
-    fn configured_wire_api_overrides_model_default() {
+    fn configured_wire_api_overrides_default() {
         let provider = deepseek_provider(Some("chat_completions"));
-        assert!(matches!(
-            provider.wire_api_for_model("deepseek-v4-flash").unwrap(),
-            WireApi::ChatCompletions
-        ));
+        assert!(matches!(provider.wire_api(), WireApi::ChatCompletions));
 
         let provider = deepseek_provider(Some("responses"));
-        assert!(matches!(
-            provider.wire_api_for_model("deepseek-v4-flash").unwrap(),
-            WireApi::Responses
-        ));
-    }
-
-    #[test]
-    fn configured_responses_rejects_unsupported_deepseek_model() {
-        let provider = deepseek_provider(Some("responses"));
-        let error = provider.wire_api_for_model("deepseek-v4-pro").unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("supports deepseek-v4-flash only"));
+        assert!(matches!(provider.wire_api(), WireApi::Responses));
+        assert!(
+            provider
+                .capabilities("deepseek-v4-pro")
+                .provider_item_replay
+        );
     }
 }

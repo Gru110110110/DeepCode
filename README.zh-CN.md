@@ -87,7 +87,7 @@ type = "ollama"
 base_url = "http://localhost:11434"
 ```
 
-当前支持的提供商类型是 `openai`、`anthropic`、`deepseek`、`kimi` 和 `ollama`。`kimi` 提供商使用 Kimi Code 会员密钥，默认连接 `https://api.kimi.com/coding/v1`，提供 `k3`、`k3-256k`、`kimi-for-coding` 和 `kimi-for-coding-highspeed`。未显式配置模型时，会选择所有会员均可用的 `kimi-for-coding`。官方 OpenAI 端点默认使用 Responses API。OpenAI 风格网关和 DeepSeek 默认使用 Chat Completions；可以在 OpenAI 或 DeepSeek 提供商表中设置 `wire_api = "responses"` 或 `wire_api = "chat_completions"` 来覆盖。当前 DeepSeek 实现只接受 `deepseek-v4-flash` 使用 Responses API。
+当前支持的提供商类型是 `openai`、`anthropic`、`deepseek`、`kimi` 和 `ollama`。`kimi` 提供商使用 Kimi Code 会员密钥，默认连接 `https://api.kimi.com/coding/v1`，提供 `k3`、`k3-256k`、`kimi-for-coding` 和 `kimi-for-coding-highspeed`。未显式配置模型时，会选择所有会员均可用的 `kimi-for-coding`。官方 OpenAI 端点默认使用 Responses API。OpenAI 风格网关和 DeepSeek 默认使用 Chat Completions；可以在 OpenAI 或 DeepSeek 提供商表中设置 `wire_api = "responses"` 或 `wire_api = "chat_completions"` 来覆盖。[DeepSeek Responses API 文档](https://api-docs.deepseek.com/zh-cn/guides/responses_api/)当前列出 `deepseek-v4-flash` 和 `deepseek-v4-pro`。DeepCode 不再维护一份独立的模型白名单；显式选择 Responses API 后，由 DeepSeek 校验所配置模型是否支持。
 
 可选提供商字段示例：
 
@@ -96,8 +96,9 @@ base_url = "http://localhost:11434"
 type = "deepseek"
 api_key = "your-api-key-here"
 base_url = "https://api.deepseek.com"
-model = "deepseek-v4-flash"
+model = "deepseek-v4-pro"
 reasoning_effort = "high"
+wire_api = "responses"
 connect_timeout_secs = 30
 read_timeout_secs = 300
 max_concurrent_requests = 4
