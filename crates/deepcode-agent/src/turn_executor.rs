@@ -16,7 +16,7 @@ use crate::llm_response::{
     tool_calls_from_blocks, StreamResponseOutcome, SESSION_TITLE_INSTRUCTION,
 };
 use crate::permission_handler::{
-    resolve_permission, wait_for_file_preview_response, FilePreviewOutcome,
+    resolve_permission, wait_for_file_preview_response, FilePreviewOutcome, PermissionResolution,
 };
 use crate::r#loop::{handle_busy_command, BusyControl};
 use crate::state::{AgentPhase, AgentState, ToolResultEntry};
@@ -25,6 +25,71 @@ use crate::validation::invalid_tool_input_message;
 pub(crate) struct TurnResult {
     pub interrupted: bool,
     pub shutdown_requested: bool,
+}
+
+const REPEATED_FAILURE_LIMIT: usize = 2;
+const REPEATED_BLOCKED_ROUND_LIMIT: usize = 2;
+const REPEATED_FAILURE_INSTRUCTION: &str = "You have executed this exact tool call twice and it failed both times. Do not retry the same tool with the same input again. Change the input, gather new information first, use a materially different approach, or stop and explain the blocker to the user.";
+const REPEATED_CALL_BLOCKED_MESSAGE: &str = "Repeated-failure guard blocked this tool call because the same tool and input already failed twice. The tool was not executed. Use a materially different approach or explain the blocker to the user.";
+
+#[derive(Debug, Clone, PartialEq)]
+struct ToolCallSignature {
+    name: String,
+    input: serde_json::Value,
+}
+
+impl ToolCallSignature {
+    fn new(name: &str, input: &serde_json::Value) -> Self {
+        Self {
+            name: name.to_string(),
+            input: input.clone(),
+        }
+    }
+
+    fn matches(&self, name: &str, input: &serde_json::Value) -> bool {
+        self.name == name && self.input == *input
+    }
+}
+
+#[derive(Debug)]
+struct FailureStreak {
+    signature: ToolCallSignature,
+    count: usize,
+}
+
+#[derive(Debug, Default)]
+struct RepeatedFailureGuard {
+    streak: Option<FailureStreak>,
+}
+
+impl RepeatedFailureGuard {
+    fn record_failure(&mut self, name: &str, input: &serde_json::Value) -> bool {
+        match self.streak.as_mut() {
+            Some(streak) if streak.signature.matches(name, input) => {
+                streak.count = streak.count.saturating_add(1);
+            }
+            _ => {
+                self.streak = Some(FailureStreak {
+                    signature: ToolCallSignature::new(name, input),
+                    count: 1,
+                });
+            }
+        }
+
+        self.streak
+            .as_ref()
+            .is_some_and(|streak| streak.count == REPEATED_FAILURE_LIMIT)
+    }
+
+    fn should_block(&self, name: &str, input: &serde_json::Value) -> bool {
+        self.streak.as_ref().is_some_and(|streak| {
+            streak.count >= REPEATED_FAILURE_LIMIT && streak.signature.matches(name, input)
+        })
+    }
+
+    fn reset(&mut self) {
+        self.streak = None;
+    }
 }
 
 fn messages_with_title_instruction(messages: &[Message]) -> Vec<Message> {
@@ -62,6 +127,7 @@ struct ParallelToolCall {
 struct ToolExecutionResult {
     id: String,
     name: String,
+    input: serde_json::Value,
     result: std::result::Result<String, String>,
 }
 
@@ -82,6 +148,67 @@ fn push_tool_result_and_update(
     send_session_updated(event_tx, state);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn tracked_tool_result_entry(
+    failure_guard: &mut RepeatedFailureGuard,
+    event_tx: &EventSender,
+    turn: usize,
+    tool_id: &str,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    content: &str,
+    is_error: bool,
+) -> ToolResultEntry {
+    let content = if is_error {
+        if failure_guard.record_failure(tool_name, tool_input) {
+            tracing::warn!(
+                turn = turn + 1,
+                tool = %tool_name,
+                tool_id = %tool_id,
+                consecutive_failures = REPEATED_FAILURE_LIMIT,
+                "Repeated tool failure detected"
+            );
+            let _ = event_tx.send(AgentEvent::StatusUpdate {
+                message: "Changing strategy after a repeated tool failure...".to_string(),
+            });
+            format!("{}\n\n{}", content, REPEATED_FAILURE_INSTRUCTION)
+        } else {
+            content.to_string()
+        }
+    } else {
+        failure_guard.reset();
+        content.to_string()
+    };
+
+    ToolResultEntry::new(tool_id, content, is_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_tracked_tool_result_and_update(
+    state: &mut AgentState,
+    event_tx: &EventSender,
+    failure_guard: &mut RepeatedFailureGuard,
+    turn: usize,
+    tool_id: &str,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    content: &str,
+    is_error: bool,
+) {
+    let entry = tracked_tool_result_entry(
+        failure_guard,
+        event_tx,
+        turn,
+        tool_id,
+        tool_name,
+        tool_input,
+        content,
+        is_error,
+    );
+    state.push_tool_results(vec![entry]);
+    send_session_updated(event_tx, state);
+}
+
 fn model_request_status(turn: usize) -> String {
     if turn == 0 {
         "Thinking...".to_string()
@@ -97,6 +224,7 @@ async fn flush_parallel_tool_calls(
     cmd_rx: &mut CmdReceiver,
     event_tx: &EventSender,
     state: &mut AgentState,
+    failure_guard: &mut RepeatedFailureGuard,
     turn: usize,
     interrupted: &mut bool,
     shutdown_requested: &mut bool,
@@ -125,13 +253,15 @@ async fn flush_parallel_tool_calls(
     let execute_future = futures::future::join_all(calls.into_iter().map(|call| {
         let tools = Arc::clone(tools);
         async move {
+            let input = call.input;
             let result = tools
-                .execute_with_context(&call.name, call.input, call.context)
+                .execute_with_context(&call.name, input.clone(), call.context)
                 .await
                 .map_err(|e| e.to_string());
             ToolExecutionResult {
                 id: call.id,
                 name: call.name,
+                input,
                 result,
             }
         }
@@ -178,10 +308,19 @@ async fn flush_parallel_tool_calls(
                 );
                 let _ = event_tx.send(AgentEvent::ToolCallCompleted {
                     id: execution_result.id.clone(),
-                    name: execution_result.name,
+                    name: execution_result.name.clone(),
                     result: result.clone(),
                 });
-                tool_results.push(ToolResultEntry::new(execution_result.id, result, false));
+                tool_results.push(tracked_tool_result_entry(
+                    failure_guard,
+                    event_tx,
+                    turn,
+                    &execution_result.id,
+                    &execution_result.name,
+                    &execution_result.input,
+                    &result,
+                    false,
+                ));
             }
             Err(error) => {
                 tracing::warn!(
@@ -193,10 +332,19 @@ async fn flush_parallel_tool_calls(
                 );
                 let _ = event_tx.send(AgentEvent::ToolCallFailed {
                     id: execution_result.id.clone(),
-                    name: execution_result.name,
+                    name: execution_result.name.clone(),
                     error: error.clone(),
                 });
-                tool_results.push(ToolResultEntry::new(execution_result.id, error, true));
+                tool_results.push(tracked_tool_result_entry(
+                    failure_guard,
+                    event_tx,
+                    turn,
+                    &execution_result.id,
+                    &execution_result.name,
+                    &execution_result.input,
+                    &error,
+                    true,
+                ));
             }
         }
     }
@@ -219,6 +367,9 @@ pub(crate) async fn execute_turn(
     let mut tool_call_count = 0usize;
     let mut interrupted = false;
     let mut shutdown_requested = false;
+    let mut failure_guard = RepeatedFailureGuard::default();
+    let mut force_text_only = false;
+    let mut blocked_only_rounds = 0usize;
     let (max_tokens, context_window) = model_config;
     let reserved_output = max_tokens.min(context_window / 4);
     let input_budget = context_window.saturating_sub(reserved_output);
@@ -280,7 +431,12 @@ pub(crate) async fn execute_turn(
 
         // 2. Call LLM with streaming
         state.phase = AgentPhase::Generating;
-        let tool_defs = tools.definitions();
+        let text_only_request = std::mem::take(&mut force_text_only);
+        let tool_defs = if text_only_request {
+            Vec::new()
+        } else {
+            tools.definitions()
+        };
         let _ = event_tx.send(AgentEvent::StatusUpdate {
             message: model_request_status(turn),
         });
@@ -454,6 +610,29 @@ pub(crate) async fn execute_turn(
             break;
         }
 
+        if text_only_request {
+            let final_message = "Stopped because the model retried an identical tool call after it had already failed twice. The repeated call was not executed.".to_string();
+            let mut blocked_results = Vec::with_capacity(tool_calls.len());
+            for (tool_id, tool_name, _) in &tool_calls {
+                let _ = event_tx.send(AgentEvent::ToolCallFailed {
+                    id: tool_id.clone(),
+                    name: tool_name.clone(),
+                    error: REPEATED_CALL_BLOCKED_MESSAGE.to_string(),
+                });
+                blocked_results.push(ToolResultEntry::new(
+                    tool_id,
+                    REPEATED_CALL_BLOCKED_MESSAGE,
+                    true,
+                ));
+            }
+            state.push_tool_results(blocked_results);
+            state.push_assistant(vec![ContentBlock::text(&final_message)]);
+            send_session_updated(event_tx, state);
+            let _ = event_tx.send(AgentEvent::AgentFinished { final_message });
+            state.phase = AgentPhase::Idle;
+            break;
+        }
+
         // 6. Execute tool calls with permission checks
         state.phase = AgentPhase::ParsingToolCalls;
         tracing::info!(
@@ -465,7 +644,59 @@ pub(crate) async fn execute_turn(
             message: format!("Preparing {} tool call(s)...", tool_calls.len()),
         });
         let mut parallel_batch = Vec::new();
+        let mut blocked_repeat_calls = 0usize;
         for (tool_id, tool_name, tool_input) in &tool_calls {
+            tool_call_count += 1;
+            let same_signature_pending = parallel_batch.iter().any(|call: &ParallelToolCall| {
+                call.name == *tool_name && call.input == *tool_input
+            });
+            if failure_guard.should_block(tool_name, tool_input) || same_signature_pending {
+                flush_parallel_tool_calls(
+                    &mut parallel_batch,
+                    tools,
+                    cmd_rx,
+                    event_tx,
+                    state,
+                    &mut failure_guard,
+                    turn,
+                    &mut interrupted,
+                    &mut shutdown_requested,
+                )
+                .await;
+                if interrupted || shutdown_requested {
+                    break;
+                }
+            }
+
+            if failure_guard.should_block(tool_name, tool_input) {
+                tracing::warn!(
+                    turn = turn + 1,
+                    tool = %tool_name,
+                    tool_id = %tool_id,
+                    tool_call_index = tool_call_count,
+                    "Repeated tool call blocked before execution"
+                );
+                let _ = event_tx.send(AgentEvent::ToolCallStarted {
+                    id: tool_id.clone(),
+                    name: tool_name.clone(),
+                    input: tool_input.clone(),
+                });
+                let _ = event_tx.send(AgentEvent::ToolCallFailed {
+                    id: tool_id.clone(),
+                    name: tool_name.clone(),
+                    error: REPEATED_CALL_BLOCKED_MESSAGE.to_string(),
+                });
+                push_tool_result_and_update(
+                    state,
+                    event_tx,
+                    tool_id,
+                    REPEATED_CALL_BLOCKED_MESSAGE,
+                    true,
+                );
+                blocked_repeat_calls = blocked_repeat_calls.saturating_add(1);
+                continue;
+            }
+
             let tool = match tools.get(tool_name) {
                 Some(t) => t.clone(),
                 None => {
@@ -475,6 +706,7 @@ pub(crate) async fn execute_turn(
                         cmd_rx,
                         event_tx,
                         state,
+                        &mut failure_guard,
                         turn,
                         &mut interrupted,
                         &mut shutdown_requested,
@@ -493,12 +725,20 @@ pub(crate) async fn execute_turn(
                     let _ = event_tx.send(AgentEvent::StatusUpdate {
                         message: "Adjusting tool selection...".to_string(),
                     });
-                    push_tool_result_and_update(state, event_tx, tool_id, &err, true);
+                    push_tracked_tool_result_and_update(
+                        state,
+                        event_tx,
+                        &mut failure_guard,
+                        turn,
+                        tool_id,
+                        tool_name,
+                        tool_input,
+                        &err,
+                        true,
+                    );
                     continue;
                 }
             };
-
-            tool_call_count += 1;
 
             if let Some(err) = invalid_tool_input_message(tool_name, tool.as_ref(), tool_input) {
                 flush_parallel_tool_calls(
@@ -507,6 +747,7 @@ pub(crate) async fn execute_turn(
                     cmd_rx,
                     event_tx,
                     state,
+                    &mut failure_guard,
                     turn,
                     &mut interrupted,
                     &mut shutdown_requested,
@@ -526,7 +767,17 @@ pub(crate) async fn execute_turn(
                 let _ = event_tx.send(AgentEvent::StatusUpdate {
                     message: "Adjusting tool arguments...".to_string(),
                 });
-                push_tool_result_and_update(state, event_tx, tool_id, &err, true);
+                push_tracked_tool_result_and_update(
+                    state,
+                    event_tx,
+                    &mut failure_guard,
+                    turn,
+                    tool_id,
+                    tool_name,
+                    tool_input,
+                    &err,
+                    true,
+                );
                 continue;
             }
 
@@ -537,6 +788,7 @@ pub(crate) async fn execute_turn(
                     cmd_rx,
                     event_tx,
                     state,
+                    &mut failure_guard,
                     turn,
                     &mut interrupted,
                     &mut shutdown_requested,
@@ -556,7 +808,17 @@ pub(crate) async fn execute_turn(
                 let _ = event_tx.send(AgentEvent::StatusUpdate {
                     message: "Adjusting tool command...".to_string(),
                 });
-                push_tool_result_and_update(state, event_tx, tool_id, &err.to_string(), true);
+                push_tracked_tool_result_and_update(
+                    state,
+                    event_tx,
+                    &mut failure_guard,
+                    turn,
+                    tool_id,
+                    tool_name,
+                    tool_input,
+                    &err.to_string(),
+                    true,
+                );
                 continue;
             }
 
@@ -569,6 +831,7 @@ pub(crate) async fn execute_turn(
                     cmd_rx,
                     event_tx,
                     state,
+                    &mut failure_guard,
                     turn,
                     &mut interrupted,
                     &mut shutdown_requested,
@@ -611,6 +874,7 @@ pub(crate) async fn execute_turn(
                         cmd_rx,
                         event_tx,
                         state,
+                        &mut failure_guard,
                         turn,
                         &mut interrupted,
                         &mut shutdown_requested,
@@ -645,7 +909,17 @@ pub(crate) async fn execute_turn(
                         name: tool_name.clone(),
                         error: e.to_string(),
                     });
-                    push_tool_result_and_update(state, event_tx, tool_id, &e.to_string(), true);
+                    push_tracked_tool_result_and_update(
+                        state,
+                        event_tx,
+                        &mut failure_guard,
+                        turn,
+                        tool_id,
+                        tool_name,
+                        tool_input,
+                        &e.to_string(),
+                        true,
+                    );
                     continue;
                 }
             };
@@ -657,6 +931,7 @@ pub(crate) async fn execute_turn(
                     cmd_rx,
                     event_tx,
                     state,
+                    &mut failure_guard,
                     turn,
                     &mut interrupted,
                     &mut shutdown_requested,
@@ -679,7 +954,7 @@ pub(crate) async fn execute_turn(
                         input: tool_input.clone(),
                     });
                 }
-                resolve_permission(
+                let resolution = resolve_permission(
                     evaluation,
                     tool_name,
                     tool_input,
@@ -688,13 +963,35 @@ pub(crate) async fn execute_turn(
                     cmd_rx,
                     event_tx,
                     state,
-                    &mut interrupted,
-                    &mut shutdown_requested,
                     turn,
                 )
                 .await;
-                if interrupted || shutdown_requested {
-                    break;
+                match resolution {
+                    PermissionResolution::DeniedByPolicy(error) => {
+                        push_tracked_tool_result_and_update(
+                            state,
+                            event_tx,
+                            &mut failure_guard,
+                            turn,
+                            tool_id,
+                            tool_name,
+                            tool_input,
+                            &error,
+                            true,
+                        );
+                    }
+                    PermissionResolution::Interrupted => {
+                        interrupted = true;
+                        break;
+                    }
+                    PermissionResolution::Shutdown => {
+                        shutdown_requested = true;
+                        break;
+                    }
+                    PermissionResolution::Approved | PermissionResolution::DeniedByUser => {
+                        debug_assert!(false, "forbidden policy produced an unexpected resolution");
+                        failure_guard.reset();
+                    }
                 }
                 continue;
             }
@@ -708,6 +1005,7 @@ pub(crate) async fn execute_turn(
                         cmd_rx,
                         event_tx,
                         state,
+                        &mut failure_guard,
                         turn,
                         &mut interrupted,
                         &mut shutdown_requested,
@@ -742,7 +1040,17 @@ pub(crate) async fn execute_turn(
                         name: tool_name.clone(),
                         error: e.to_string(),
                     });
-                    push_tool_result_and_update(state, event_tx, tool_id, &e.to_string(), true);
+                    push_tracked_tool_result_and_update(
+                        state,
+                        event_tx,
+                        &mut failure_guard,
+                        turn,
+                        tool_id,
+                        tool_name,
+                        tool_input,
+                        &e.to_string(),
+                        true,
+                    );
                     continue;
                 }
             };
@@ -754,6 +1062,7 @@ pub(crate) async fn execute_turn(
                     cmd_rx,
                     event_tx,
                     state,
+                    &mut failure_guard,
                     turn,
                     &mut interrupted,
                     &mut shutdown_requested,
@@ -801,6 +1110,7 @@ pub(crate) async fn execute_turn(
                             FilePreviewOutcome::Approved => true,
                             FilePreviewOutcome::Denied => {
                                 let err = "File change rejected by user".to_string();
+                                failure_guard.reset();
                                 tracing::warn!(
                                     turn = turn + 1,
                                     tool = %tool_name,
@@ -851,7 +1161,17 @@ pub(crate) async fn execute_turn(
                             name: tool_name.clone(),
                             result: result.clone(),
                         });
-                        push_tool_result_and_update(state, event_tx, tool_id, &result, false);
+                        push_tracked_tool_result_and_update(
+                            state,
+                            event_tx,
+                            &mut failure_guard,
+                            turn,
+                            tool_id,
+                            tool_name,
+                            tool_input,
+                            &result,
+                            false,
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -866,7 +1186,17 @@ pub(crate) async fn execute_turn(
                             name: tool_name.clone(),
                             error: e.to_string(),
                         });
-                        push_tool_result_and_update(state, event_tx, tool_id, &e.to_string(), true);
+                        push_tracked_tool_result_and_update(
+                            state,
+                            event_tx,
+                            &mut failure_guard,
+                            turn,
+                            tool_id,
+                            tool_name,
+                            tool_input,
+                            &e.to_string(),
+                            true,
+                        );
                     }
                 }
                 continue;
@@ -891,6 +1221,7 @@ pub(crate) async fn execute_turn(
                 cmd_rx,
                 event_tx,
                 state,
+                &mut failure_guard,
                 turn,
                 &mut interrupted,
                 &mut shutdown_requested,
@@ -917,7 +1248,7 @@ pub(crate) async fn execute_turn(
             let execution_context = ToolExecutionContext {
                 sandbox_policy: Some(evaluation.sandbox_policy.clone()),
             };
-            let approved = resolve_permission(
+            let resolution = resolve_permission(
                 evaluation,
                 tool_name,
                 tool_input,
@@ -926,17 +1257,45 @@ pub(crate) async fn execute_turn(
                 cmd_rx,
                 event_tx,
                 state,
-                &mut interrupted,
-                &mut shutdown_requested,
                 turn,
             )
             .await;
 
-            if !approved {
-                if interrupted || shutdown_requested {
+            match resolution {
+                PermissionResolution::Approved => {}
+                PermissionResolution::DeniedByPolicy(error) => {
+                    push_tracked_tool_result_and_update(
+                        state,
+                        event_tx,
+                        &mut failure_guard,
+                        turn,
+                        tool_id,
+                        tool_name,
+                        tool_input,
+                        &error,
+                        true,
+                    );
+                    continue;
+                }
+                PermissionResolution::DeniedByUser => {
+                    failure_guard.reset();
+                    push_tool_result_and_update(
+                        state,
+                        event_tx,
+                        tool_id,
+                        "Permission denied by user",
+                        true,
+                    );
+                    continue;
+                }
+                PermissionResolution::Interrupted => {
+                    interrupted = true;
                     break;
                 }
-                continue;
+                PermissionResolution::Shutdown => {
+                    shutdown_requested = true;
+                    break;
+                }
             }
 
             state.phase = AgentPhase::ExecutingTools;
@@ -984,7 +1343,17 @@ pub(crate) async fn execute_turn(
                         name: tool_name.clone(),
                         result: result.clone(),
                     });
-                    push_tool_result_and_update(state, event_tx, tool_id, &result, false);
+                    push_tracked_tool_result_and_update(
+                        state,
+                        event_tx,
+                        &mut failure_guard,
+                        turn,
+                        tool_id,
+                        tool_name,
+                        tool_input,
+                        &result,
+                        false,
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -999,7 +1368,17 @@ pub(crate) async fn execute_turn(
                         name: tool_name.clone(),
                         error: e.to_string(),
                     });
-                    push_tool_result_and_update(state, event_tx, tool_id, &e.to_string(), true);
+                    push_tracked_tool_result_and_update(
+                        state,
+                        event_tx,
+                        &mut failure_guard,
+                        turn,
+                        tool_id,
+                        tool_name,
+                        tool_input,
+                        &e.to_string(),
+                        true,
+                    );
                 }
             }
         }
@@ -1011,6 +1390,7 @@ pub(crate) async fn execute_turn(
                 cmd_rx,
                 event_tx,
                 state,
+                &mut failure_guard,
                 turn,
                 &mut interrupted,
                 &mut shutdown_requested,
@@ -1028,6 +1408,25 @@ pub(crate) async fn execute_turn(
             break;
         }
 
+        if blocked_repeat_calls == tool_calls.len() {
+            blocked_only_rounds = blocked_only_rounds.saturating_add(1);
+            // Keep tools available after the first block so the model can recover. A second
+            // blocked-only round proves it ignored that opportunity and may be safely stopped.
+            if blocked_only_rounds >= REPEATED_BLOCKED_ROUND_LIMIT {
+                force_text_only = true;
+                let _ = event_tx.send(AgentEvent::StatusUpdate {
+                    message: "Stopping repeated tool retries and preparing an explanation..."
+                        .to_string(),
+                });
+            } else {
+                let _ = event_tx.send(AgentEvent::StatusUpdate {
+                    message: "Repeated call blocked; trying a different approach...".to_string(),
+                });
+            }
+        } else {
+            blocked_only_rounds = 0;
+        }
+
         // Loop back to LLM call with tool results
         turn = turn.saturating_add(1);
     }
@@ -1035,5 +1434,40 @@ pub(crate) async fn execute_turn(
     TurnResult {
         interrupted,
         shutdown_requested,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_failure_guard_warns_after_two_and_blocks_the_third_attempt() {
+        let mut guard = RepeatedFailureGuard::default();
+        let first_input = serde_json::json!({"path": "a.rs", "old": "x"});
+        let reordered_input = serde_json::json!({"old": "x", "path": "a.rs"});
+
+        assert!(!guard.record_failure("edit_file", &first_input));
+        assert!(guard.record_failure("edit_file", &reordered_input));
+        assert!(guard.should_block("edit_file", &first_input));
+    }
+
+    #[test]
+    fn repeated_failure_guard_ignores_error_text_but_resets_on_changed_input_or_success() {
+        let mut guard = RepeatedFailureGuard::default();
+        let input = serde_json::json!({"path": "a.rs"});
+        let changed_input = serde_json::json!({"path": "b.rs"});
+
+        assert!(!guard.record_failure("edit_file", &input));
+        assert!(guard.record_failure("edit_file", &input));
+        assert!(guard.should_block("edit_file", &input));
+
+        assert!(!guard.record_failure("edit_file", &changed_input));
+        assert!(!guard.should_block("edit_file", &input));
+
+        assert!(guard.record_failure("edit_file", &changed_input));
+        assert!(guard.should_block("edit_file", &changed_input));
+        guard.reset();
+        assert!(!guard.should_block("edit_file", &changed_input));
     }
 }

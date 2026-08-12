@@ -21,6 +21,14 @@ pub(crate) enum FilePreviewOutcome {
     Shutdown,
 }
 
+pub(crate) enum PermissionResolution {
+    Approved,
+    DeniedByPolicy(String),
+    DeniedByUser,
+    Interrupted,
+    Shutdown,
+}
+
 pub(crate) async fn wait_for_permission_response(
     cmd_rx: &mut CmdReceiver,
     request_id: &str,
@@ -116,12 +124,10 @@ pub(crate) async fn resolve_permission(
     cmd_rx: &mut CmdReceiver,
     event_tx: &EventSender,
     state: &mut AgentState,
-    interrupted: &mut bool,
-    shutdown_requested: &mut bool,
     turn: usize,
-) -> bool {
+) -> PermissionResolution {
     match evaluation.decision {
-        Decision::Allow => true,
+        Decision::Allow => PermissionResolution::Approved,
         Decision::Forbidden => {
             let reason = evaluation
                 .justification
@@ -139,11 +145,7 @@ pub(crate) async fn resolve_permission(
                 name: tool_name.to_string(),
                 error: reason.clone(),
             });
-            state.push_tool_result(tool_id, &format!("Permission denied: {}", reason), true);
-            let _ = event_tx.send(AgentEvent::SessionUpdated {
-                messages: state.messages.clone(),
-            });
-            false
+            PermissionResolution::DeniedByPolicy(format!("Permission denied: {}", reason))
         }
         Decision::Prompt => {
             let req_id = uuid::Uuid::new_v4().to_string();
@@ -176,7 +178,7 @@ pub(crate) async fn resolve_permission(
                         let mut perm = permissions.lock().await;
                         let _ = perm.handle_response(tool_name, tool_input, true, scope);
                     }
-                    true
+                    PermissionResolution::Approved
                 }
                 PermissionOutcome::Denied => {
                     tracing::warn!(
@@ -195,11 +197,7 @@ pub(crate) async fn resolve_permission(
                         let _ =
                             perm.handle_response(tool_name, tool_input, false, ApprovalScope::Once);
                     }
-                    state.push_tool_result(tool_id, "Permission denied by user", true);
-                    let _ = event_tx.send(AgentEvent::SessionUpdated {
-                        messages: state.messages.clone(),
-                    });
-                    false
+                    PermissionResolution::DeniedByUser
                 }
                 PermissionOutcome::Interrupted => {
                     tracing::info!(
@@ -208,8 +206,7 @@ pub(crate) async fn resolve_permission(
                         tool_id = %tool_id,
                         "Interrupted while waiting for permission"
                     );
-                    *interrupted = true;
-                    false
+                    PermissionResolution::Interrupted
                 }
                 PermissionOutcome::Shutdown => {
                     tracing::info!(
@@ -218,8 +215,7 @@ pub(crate) async fn resolve_permission(
                         tool_id = %tool_id,
                         "Shutdown while waiting for permission"
                     );
-                    *shutdown_requested = true;
-                    false
+                    PermissionResolution::Shutdown
                 }
             }
         }

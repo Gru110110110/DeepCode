@@ -367,6 +367,45 @@ mod tests {
         compressor: TestCompressor,
     }
 
+    struct RepeatingFailureProvider {
+        calls: AtomicUsize,
+        recover_after_block: bool,
+        tool_name: String,
+        tool_input: String,
+        request_builder: TestRequestBuilder,
+        response_parser: TestResponseParser,
+        compressor: TestCompressor,
+    }
+
+    impl RepeatingFailureProvider {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                recover_after_block: false,
+                tool_name: "always_fail".to_string(),
+                tool_input: "{\"value\":\"same\"}".to_string(),
+                request_builder: TestRequestBuilder,
+                response_parser: TestResponseParser,
+                compressor: TestCompressor,
+            }
+        }
+
+        fn recovering() -> Self {
+            Self {
+                recover_after_block: true,
+                ..Self::new()
+            }
+        }
+
+        fn repeating(tool_name: &str, tool_input: &str) -> Self {
+            Self {
+                tool_name: tool_name.to_string(),
+                tool_input: tool_input.to_string(),
+                ..Self::new()
+            }
+        }
+    }
+
     impl ToolLoopProvider {
         fn new() -> Self {
             Self::with_tool_input("{\"value\":\"ok\"}")
@@ -512,7 +551,101 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl LlmProvider for RepeatingFailureProvider {
+        fn name(&self) -> &str {
+            "repeating-failure-test"
+        }
+
+        fn request_builder(&self) -> &dyn RequestBuilder {
+            &self.request_builder
+        }
+
+        fn response_parser(&self) -> &dyn ResponseParser {
+            &self.response_parser
+        }
+
+        fn context_compressor(&self) -> &dyn ContextCompressor {
+            &self.compressor
+        }
+
+        async fn generate_stream(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            tools: &[ToolDefinition],
+            _system_prompt: Option<&str>,
+            _params: &GenerateParams,
+        ) -> CoreResult<Pin<Box<dyn Stream<Item = CoreResult<StreamDelta>> + Send>>> {
+            let request_index = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let deltas = if tools.is_empty() {
+                vec![
+                    StreamDelta::TextDelta(
+                        "I could not complete the repeated operation.".to_string(),
+                    ),
+                    StreamDelta::Finished(FinishReason::Stop),
+                ]
+            } else if self.recover_after_block && request_index == 4 {
+                vec![
+                    StreamDelta::ToolUseStart {
+                        id: "recovery_call".to_string(),
+                        name: "echo_tool".to_string(),
+                        index: None,
+                        input_delta: None,
+                    },
+                    StreamDelta::ToolUseInput {
+                        id: "recovery_call".to_string(),
+                        index: None,
+                        input_delta: "{\"value\":\"recovered\"}".to_string(),
+                    },
+                    StreamDelta::ToolUseEnd {
+                        id: "recovery_call".to_string(),
+                        index: None,
+                    },
+                    StreamDelta::Finished(FinishReason::ToolCalls),
+                ]
+            } else if self.recover_after_block && request_index >= 5 {
+                vec![
+                    StreamDelta::TextDelta("Recovered with a different approach.".to_string()),
+                    StreamDelta::Finished(FinishReason::Stop),
+                ]
+            } else {
+                vec![
+                    StreamDelta::ToolUseStart {
+                        id: format!("repeat_call_{request_index}"),
+                        name: self.tool_name.clone(),
+                        index: None,
+                        input_delta: None,
+                    },
+                    StreamDelta::ToolUseInput {
+                        id: format!("repeat_call_{request_index}"),
+                        index: None,
+                        input_delta: self.tool_input.clone(),
+                    },
+                    StreamDelta::ToolUseEnd {
+                        id: format!("repeat_call_{request_index}"),
+                        index: None,
+                    },
+                    StreamDelta::Finished(FinishReason::ToolCalls),
+                ]
+            };
+            Ok(Box::pin(stream::iter(deltas.into_iter().map(Ok))))
+        }
+
+        async fn send_request(&self, _body: &serde_json::Value) -> CoreResult<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
     struct EchoTool;
+
+    struct AlwaysFailTool {
+        executions: Arc<AtomicUsize>,
+    }
+
+    struct TestShellTool {
+        executions: Arc<AtomicUsize>,
+    }
 
     struct PreflightRejectTool {
         executions: Arc<AtomicUsize>,
@@ -542,6 +675,65 @@ mod tests {
 
         async fn execute(&self, input: serde_json::Value) -> CoreResult<String> {
             Ok(input["value"].as_str().unwrap_or("").to_string())
+        }
+    }
+
+    #[async_trait]
+    impl Tool for AlwaysFailTool {
+        fn name(&self) -> &str {
+            "always_fail"
+        }
+
+        fn description(&self) -> &str {
+            "Always returns the same failure"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            })
+        }
+
+        fn safety(&self) -> ToolSafety {
+            ToolSafety::READ_ONLY
+        }
+
+        async fn execute(&self, _input: serde_json::Value) -> CoreResult<String> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Err(DeepCodeError::ToolExecution {
+                tool: self.name().to_string(),
+                message: "deterministic failure".to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TestShellTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+
+        fn description(&self) -> &str {
+            "Test shell"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            })
+        }
+
+        fn safety(&self) -> ToolSafety {
+            ToolSafety::DESTRUCTIVE
+        }
+
+        async fn execute(&self, _input: serde_json::Value) -> CoreResult<String> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok("executed".to_string())
         }
     }
 
@@ -907,6 +1099,70 @@ mod tests {
         (events, executions.load(Ordering::SeqCst))
     }
 
+    async fn run_permission_agent(approved: bool) -> (Vec<AgentEvent>, usize) {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TestShellTool {
+            executions: executions.clone(),
+        }));
+        let tools = Arc::new(registry);
+        let permissions = Arc::new(tokio::sync::Mutex::new(PermissionSystem::new(
+            deepcode_permissions::policy::PermissionSystemConfig::default(),
+        )));
+        let (cmd_tx, cmd_rx) = crate::event::cmd_channel(8);
+        let (event_tx, mut event_rx) = crate::event::event_channel();
+
+        let handle = tokio::spawn(run(
+            Arc::new(ToolLoopProvider::with_tool_call(
+                "shell",
+                "{\"command\":\"cargo check\"}",
+            )),
+            tools,
+            permissions,
+            "test-model".to_string(),
+            (128, 4096),
+            None,
+            None,
+            None,
+            false,
+            cmd_rx,
+            event_tx,
+        ));
+
+        cmd_tx
+            .send(AgentCommand::Process {
+                message: "go".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            if let AgentEvent::PermissionNeeded { request_id, .. } = &event {
+                cmd_tx
+                    .send(AgentCommand::PermissionResponse {
+                        request_id: request_id.clone(),
+                        approved,
+                        scope: deepcode_permissions::policy::ApprovalScope::Once,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let done = matches!(
+                event,
+                AgentEvent::AgentFinished { .. } | AgentEvent::AgentError { .. }
+            );
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        (events, executions.load(Ordering::SeqCst))
+    }
+
     async fn run_plan_agent_with_registry(
         llm: Arc<dyn LlmProvider>,
         registry: ToolRegistry,
@@ -1009,6 +1265,144 @@ mod tests {
         assert!(events.iter().any(
             |event| matches!(event, AgentEvent::AgentFinished { final_message } if final_message == "done")
         ));
+    }
+
+    #[tokio::test]
+    async fn repeated_failure_guard_allows_one_recovery_round_before_stopping() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(RepeatingFailureProvider::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(AlwaysFailTool {
+            executions: executions.clone(),
+        }));
+
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_agent_with_registry(provider.clone(), registry, false),
+        )
+        .await
+        .expect("repeated failure guard should terminate the tool loop");
+
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::StatusUpdate { message }
+                    if message == "Changing strategy after a repeated tool failure..."
+            )
+        }));
+        assert!(events.iter().any(|event| match event {
+            AgentEvent::SessionUpdated { messages } => messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolResult { content, .. }
+                            if content.contains("Do not retry the same tool with the same input again")
+                    )
+                })
+            }),
+            _ => false,
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolCallFailed { error, .. }
+                    if error.contains("Repeated-failure guard blocked")
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::AgentFinished { final_message }
+                    if final_message == "I could not complete the repeated operation."
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn repeated_failure_guard_keeps_tools_available_for_a_different_approach() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(RepeatingFailureProvider::recovering());
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(AlwaysFailTool {
+            executions: executions.clone(),
+        }));
+        registry.register(Arc::new(EchoTool));
+
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_agent_with_registry(provider.clone(), registry, false),
+        )
+        .await
+        .expect("the model should be able to recover with another tool");
+
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::StatusUpdate { message }
+                    if message == "Repeated call blocked; trying a different approach..."
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolCallCompleted { name, result, .. }
+                    if name == "echo_tool" && result == "recovered"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::AgentFinished { final_message }
+                    if final_message == "Recovered with a different approach."
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn repeated_failure_guard_counts_deterministic_policy_denials() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(RepeatingFailureProvider::repeating(
+            "shell",
+            "{\"command\":\"rm -rf /\"}",
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TestShellTool {
+            executions: executions.clone(),
+        }));
+
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_agent_with_registry(provider.clone(), registry, false),
+        )
+        .await
+        .expect("repeated policy denials should terminate the tool loop");
+
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+        assert!(events.iter().any(|event| match event {
+            AgentEvent::SessionUpdated { messages } => messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolResult { content, .. }
+                            if content.contains("Permission denied")
+                                && content.contains("Do not retry the same tool")
+                    )
+                })
+            }),
+            _ => false,
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolCallFailed { error, .. }
+                    if error.contains("Repeated-failure guard blocked")
+            )
+        }));
     }
 
     #[tokio::test]
@@ -1232,6 +1626,56 @@ mod tests {
         assert_eq!(executions, 0);
         assert!(events.iter().any(
             |event| matches!(event, AgentEvent::ToolCallFailed { error, .. } if error.contains("rejected"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn user_permission_denial_is_preserved_without_counting_as_a_tool_failure() {
+        let (events, executions) = run_permission_agent(false).await;
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::PermissionNeeded { .. })));
+        assert_eq!(executions, 0);
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolCallFailed { error, .. } if error == "Permission denied by user")
+        ));
+        assert!(events.iter().any(|event| match event {
+            AgentEvent::SessionUpdated { messages } => messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolResult { content, .. }
+                            if content == "Permission denied by user"
+                    )
+                })
+            }),
+            _ => false,
+        }));
+        assert!(!events.iter().any(|event| match event {
+            AgentEvent::SessionUpdated { messages } => messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolResult { content, .. }
+                            if content.contains("Do not retry the same tool")
+                    )
+                })
+            }),
+            _ => false,
+        }));
+    }
+
+    #[tokio::test]
+    async fn user_permission_approval_still_executes_the_tool() {
+        let (events, executions) = run_permission_agent(true).await;
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::PermissionNeeded { .. })));
+        assert_eq!(executions, 1);
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolCallCompleted { result, .. } if result == "executed")
         ));
     }
 
