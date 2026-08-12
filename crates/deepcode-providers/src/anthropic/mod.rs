@@ -102,7 +102,7 @@ impl LlmProvider for AnthropicProvider {
             self.messages_url(),
             self.headers(body),
             body,
-            transport::RetryPolicy::new(2),
+            transport::RetryPolicy::REMOTE,
         )
         .await
     }
@@ -128,7 +128,7 @@ impl LlmProvider for AnthropicProvider {
             self.messages_url(),
             self.headers(&body),
             &body,
-            transport::RetryPolicy::new(2),
+            transport::RetryPolicy::REMOTE,
         )
         .await?;
         Ok(transport::hold_permit(

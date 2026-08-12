@@ -79,7 +79,14 @@ impl LlmProvider for KimiProvider {
 
     async fn send_request(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
         let _permit = self.limiter.acquire().await?;
-        transport::send_json_request(&self.client, self.url(), self.headers(), body).await
+        transport::send_json_request_with_retry(
+            &self.client,
+            self.url(),
+            self.headers(),
+            body,
+            transport::RetryPolicy::REMOTE,
+        )
+        .await
     }
 
     async fn generate_stream(
@@ -101,8 +108,14 @@ impl LlmProvider for KimiProvider {
                 serde_json::json!({"include_usage": true}),
             );
         }
-        let raw =
-            transport::send_sse_request(&self.client, self.url(), self.headers(), &body).await?;
+        let raw = transport::send_sse_request_with_retry(
+            &self.client,
+            self.url(),
+            self.headers(),
+            &body,
+            transport::RetryPolicy::REMOTE,
+        )
+        .await?;
         Ok(transport::hold_permit(
             transport::parse_sse_lines(raw, self.response_parser),
             permit,

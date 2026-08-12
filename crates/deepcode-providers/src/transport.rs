@@ -9,16 +9,19 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_millis(500);
-const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct RetryPolicy {
     max_retries: usize,
 }
 
 impl RetryPolicy {
+    pub(crate) const REMOTE: Self = Self::new(4);
+    pub(crate) const LOCAL: Self = Self::new(2);
+
     pub(crate) const fn new(max_retries: usize) -> Self {
         Self { max_retries }
     }
@@ -82,15 +85,6 @@ pub(crate) fn hold_permit(
     }))
 }
 
-pub(crate) async fn send_json_request(
-    client: &reqwest::Client,
-    url: String,
-    headers: Vec<Header>,
-    body: &serde_json::Value,
-) -> Result<serde_json::Value> {
-    send_json_request_with_retry(client, url, headers, body, RetryPolicy::default()).await
-}
-
 pub(crate) async fn send_json_request_with_retry(
     client: &reqwest::Client,
     url: String,
@@ -111,9 +105,24 @@ pub(crate) async fn send_json_request_with_retry(
                 retries += 1;
                 tokio::time::sleep(delay).await;
             }
-            Ok(resp) => return response_json(resp).await,
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.bytes().await {
+                    Ok(body) => return response_json(status, &body),
+                    Err(error)
+                        if status.is_success()
+                            && is_retryable_transport_error(&error)
+                            && retries < retry_policy.max_retries =>
+                    {
+                        let delay = exponential_backoff(retries);
+                        retries += 1;
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(error) => return Err(DeepCodeError::Http(error.to_string())),
+                }
+            }
             Err(error)
-                if is_retryable_request_error(&error) && retries < retry_policy.max_retries =>
+                if is_retryable_transport_error(&error) && retries < retry_policy.max_retries =>
             {
                 let delay = exponential_backoff(retries);
                 retries += 1;
@@ -122,15 +131,6 @@ pub(crate) async fn send_json_request_with_retry(
             Err(error) => return Err(DeepCodeError::Http(error.to_string())),
         }
     }
-}
-
-pub(crate) async fn send_sse_request(
-    client: &reqwest::Client,
-    url: String,
-    headers: Vec<Header>,
-    body: &serde_json::Value,
-) -> Result<SseLineStream> {
-    send_sse_request_with_retry(client, url, headers, body, RetryPolicy::default()).await
 }
 
 pub(crate) async fn send_sse_request_with_retry(
@@ -155,7 +155,7 @@ pub(crate) async fn send_sse_request_with_retry(
             }
             Ok(resp) => break resp,
             Err(error)
-                if is_retryable_request_error(&error) && retries < retry_policy.max_retries =>
+                if is_retryable_transport_error(&error) && retries < retry_policy.max_retries =>
             {
                 let delay = exponential_backoff(retries);
                 retries += 1;
@@ -216,9 +216,11 @@ fn should_retry_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
-fn is_retryable_request_error(error: &reqwest::Error) -> bool {
+fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
     error.is_connect()
         || error.is_timeout()
+        || error.is_body()
+        || error.is_decode()
         || (error.is_request() && !error.is_builder() && !error.is_redirect())
 }
 
@@ -233,29 +235,31 @@ fn retry_delay(resp: &reqwest::Response, retry_index: usize) -> Duration {
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     let value = value.trim();
     if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
+        return Some(Duration::from_secs(seconds).min(MAX_RETRY_DELAY));
     }
 
     let retry_at = chrono::DateTime::parse_from_rfc2822(value)
         .ok()?
         .with_timezone(&chrono::Utc);
     let now = chrono::DateTime::<chrono::Utc>::from(now);
-    Some((retry_at - now).to_std().unwrap_or(Duration::ZERO))
+    Some(
+        (retry_at - now)
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+            .min(MAX_RETRY_DELAY),
+    )
 }
 
 fn exponential_backoff(retry_index: usize) -> Duration {
     let multiplier = 1_u32.checked_shl(retry_index as u32).unwrap_or(u32::MAX);
     DEFAULT_RETRY_BACKOFF
         .saturating_mul(multiplier)
-        .min(MAX_RETRY_BACKOFF)
+        .min(MAX_RETRY_DELAY)
 }
 
-async fn response_json(resp: reqwest::Response) -> Result<serde_json::Value> {
-    let status = resp.status();
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| DeepCodeError::Http(e.to_string()))?;
+fn response_json(status: reqwest::StatusCode, body: &[u8]) -> Result<serde_json::Value> {
+    let json: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| DeepCodeError::Http(e.to_string()))?;
 
     if !status.is_success() {
         return Err(DeepCodeError::Provider(provider_error_message(&json)));
@@ -319,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_retry_statuses_are_transient() {
+    fn provider_retry_statuses_are_transient() {
         assert!(should_retry_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
         assert!(should_retry_status(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
@@ -335,12 +339,18 @@ mod tests {
     }
 
     #[test]
+    fn provider_retry_policies_have_expected_limits() {
+        assert_eq!(RetryPolicy::REMOTE.max_retries, 4);
+        assert_eq!(RetryPolicy::LOCAL.max_retries, 2);
+    }
+
+    #[test]
     fn retry_backoff_is_exponential() {
         assert_eq!(exponential_backoff(0), Duration::from_millis(500));
         assert_eq!(exponential_backoff(1), Duration::from_secs(1));
         assert_eq!(exponential_backoff(2), Duration::from_secs(2));
-        assert_eq!(exponential_backoff(32), MAX_RETRY_BACKOFF);
-        assert_eq!(exponential_backoff(usize::MAX), MAX_RETRY_BACKOFF);
+        assert_eq!(exponential_backoff(32), MAX_RETRY_DELAY);
+        assert_eq!(exponential_backoff(usize::MAX), MAX_RETRY_DELAY);
     }
 
     #[test]
@@ -359,6 +369,14 @@ mod tests {
         assert_eq!(
             parse_retry_after("Wed, 21 Oct 2026 07:27:00 GMT", SystemTime::from(now)),
             Some(Duration::ZERO)
+        );
+        assert_eq!(
+            parse_retry_after("120", SystemTime::from(now)),
+            Some(MAX_RETRY_DELAY)
+        );
+        assert_eq!(
+            parse_retry_after("18446744073709551615", SystemTime::from(now)),
+            Some(MAX_RETRY_DELAY)
         );
     }
 
@@ -490,6 +508,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_request_retries_when_response_body_is_truncated() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                if attempt == 0 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{\"ok\":",
+                        )
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                let body = r#"{"ok":true}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let response = send_json_request_with_retry(
+            &reqwest::Client::new(),
+            format!("http://{address}/messages"),
+            Vec::new(),
+            &serde_json::json!({"messages": []}),
+            RetryPolicy::new(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["ok"], true);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn streaming_request_can_outlive_read_timeout_while_data_keeps_arriving() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -516,11 +575,12 @@ mod tests {
         });
 
         let started = tokio::time::Instant::now();
-        let lines = send_sse_request(
+        let lines = send_sse_request_with_retry(
             &build_client(&provider_config(1)).unwrap(),
             format!("http://{address}/stream"),
             Vec::new(),
             &serde_json::json!({"stream": true}),
+            RetryPolicy::new(0),
         )
         .await
         .unwrap()

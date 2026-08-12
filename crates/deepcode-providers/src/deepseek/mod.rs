@@ -112,11 +112,12 @@ impl DeepSeekProvider {
         wire_api: WireApi,
     ) -> Result<serde_json::Value> {
         let _permit = self.limiter.acquire().await?;
-        transport::send_json_request(
+        transport::send_json_request_with_retry(
             &self.client,
             self.request_url(wire_api),
             self.headers(),
             body,
+            transport::RetryPolicy::REMOTE,
         )
         .await
     }
@@ -223,11 +224,12 @@ impl LlmProvider for DeepSeekProvider {
             }
         }
 
-        let raw_stream = transport::send_sse_request(
+        let raw_stream = transport::send_sse_request_with_retry(
             &self.client,
             self.request_url(wire_api),
             self.headers(),
             &body,
+            transport::RetryPolicy::REMOTE,
         )
         .await?;
         let parsed = match wire_api {

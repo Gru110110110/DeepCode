@@ -119,6 +119,14 @@ pub(crate) async fn collect_stream_response(
         }
     }
 
+    if finish_reason.is_none() {
+        let error = "LLM stream ended before a completion event".to_string();
+        let _ = event_tx.send(AgentEvent::AgentError {
+            message: error.clone(),
+        });
+        return StreamResponseOutcome::Failed { error };
+    }
+
     if let Some((visible, generated_title)) = title_filter.finish() {
         if let Some(title) = generated_title {
             let _ = event_tx.send(AgentEvent::SessionTitleGenerated {
@@ -288,6 +296,7 @@ mod tests {
         let stream: LlmStream = Box::pin(futures::stream::iter(vec![
             Ok(StreamDelta::ReasoningDelta("inspect".to_string())),
             Ok(StreamDelta::TextDelta("done".to_string())),
+            Ok(StreamDelta::Finished(FinishReason::Stop)),
         ]));
         let (_cmd_tx, mut cmd_rx) = event::cmd_channel(1);
         let (event_tx, mut event_rx) = event::event_channel();
@@ -329,6 +338,7 @@ mod tests {
             Ok(StreamDelta::TextDelta(
                 "title>Inspect parser</session-title>\nHere is the result.".to_string(),
             )),
+            Ok(StreamDelta::Finished(FinishReason::Stop)),
         ]));
         let (_cmd_tx, mut cmd_rx) = event::cmd_channel(1);
         let (event_tx, mut event_rx) = event::event_channel();
@@ -354,9 +364,12 @@ mod tests {
 
     #[tokio::test]
     async fn response_without_title_marker_is_forwarded_unchanged() {
-        let stream: LlmStream = Box::pin(futures::stream::iter(vec![Ok(StreamDelta::TextDelta(
-            "Normal answer without metadata.".to_string(),
-        ))]));
+        let stream: LlmStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamDelta::TextDelta(
+                "Normal answer without metadata.".to_string(),
+            )),
+            Ok(StreamDelta::Finished(FinishReason::Stop)),
+        ]));
         let (_cmd_tx, mut cmd_rx) = event::cmd_channel(1);
         let (event_tx, mut event_rx) = event::event_channel();
 
@@ -382,6 +395,7 @@ mod tests {
                 id: "call_1".to_string(),
                 index: None,
             }),
+            Ok(StreamDelta::Finished(FinishReason::ToolCalls)),
         ]));
         let (_cmd_tx, mut cmd_rx) = event::cmd_channel(1);
         let (event_tx, _) = event::event_channel();
@@ -392,5 +406,31 @@ mod tests {
             panic!("stream should complete");
         };
         assert!(!response.session_title_resolved);
+    }
+
+    #[tokio::test]
+    async fn premature_eof_after_partial_text_is_failed() {
+        let stream: LlmStream = Box::pin(futures::stream::iter(vec![Ok(StreamDelta::TextDelta(
+            "partial".to_string(),
+        ))]));
+        let (_cmd_tx, mut cmd_rx) = event::cmd_channel(1);
+        let (event_tx, mut event_rx) = event::event_channel();
+
+        let result = collect_stream_response(stream, &mut cmd_rx, &event_tx, false).await;
+
+        assert!(matches!(
+            result,
+            StreamResponseOutcome::Failed { ref error }
+                if error == "LLM stream ended before a completion event"
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::TextDelta(text)) if text == "partial"
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::AgentError { message })
+                if message == "LLM stream ended before a completion event"
+        ));
     }
 }

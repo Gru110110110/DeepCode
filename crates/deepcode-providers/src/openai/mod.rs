@@ -147,7 +147,14 @@ impl LlmProvider for OpenAiProvider {
 
     async fn send_request(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
         let _permit = self.limiter.acquire().await?;
-        transport::send_json_request(&self.client, self.request_url(), self.headers(), body).await
+        transport::send_json_request_with_retry(
+            &self.client,
+            self.request_url(),
+            self.headers(),
+            body,
+            transport::RetryPolicy::REMOTE,
+        )
+        .await
     }
 
     async fn generate_stream(
@@ -182,9 +189,14 @@ impl LlmProvider for OpenAiProvider {
             }
         }
 
-        let raw_stream =
-            transport::send_sse_request(&self.client, self.request_url(), self.headers(), &body)
-                .await?;
+        let raw_stream = transport::send_sse_request_with_retry(
+            &self.client,
+            self.request_url(),
+            self.headers(),
+            &body,
+            transport::RetryPolicy::REMOTE,
+        )
+        .await?;
         let parsed = match self.wire_api {
             WireApi::ChatCompletions => {
                 transport::parse_sse_lines(raw_stream, self.response_parser)
