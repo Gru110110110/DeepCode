@@ -34,13 +34,36 @@ pub(crate) fn input_status_text(state: &AppState) -> String {
     if state.status == "Ready." || state.status.starts_with("Ready. ") {
         if state.plan_mode_enabled {
             return append_usage_summary(
-                "Plan mode. Input(Enter to plan,Ctrl+C to exit)",
+                "Plan mode · Shift+Tab to switch · Enter to plan · Ctrl+C to exit",
                 state.last_usage.as_ref(),
             );
         }
         append_usage_summary(INPUT_HELP_TEXT, state.last_usage.as_ref())
     } else {
         state.status.clone()
+    }
+}
+
+pub(crate) fn set_plan_mode(state: &mut AppState, cmd_tx: &agent_event::CmdSender, enabled: bool) {
+    if state.working_since.is_some() {
+        state.status = "Already working; press Esc to interrupt before switching mode.".to_string();
+        return;
+    }
+
+    let previous = state.plan_mode_enabled;
+    state.plan_mode_enabled = enabled;
+    state.status = if enabled {
+        "Switched to Plan mode. Press Shift+Tab for Agent mode.".to_string()
+    } else {
+        "Switched to Agent mode. Press Shift+Tab for Plan mode.".to_string()
+    };
+
+    if cmd_tx
+        .blocking_send(agent_event::AgentCommand::SetPlanMode { enabled })
+        .is_err()
+    {
+        state.plan_mode_enabled = previous;
+        state.status = "Agent channel closed; mode was not changed.".to_string();
     }
 }
 
@@ -776,28 +799,14 @@ pub(crate) fn handle_slash_command(
         }
         "/plan" => {
             if parts.len() == 2 && parts[1].eq_ignore_ascii_case("off") {
-                state.plan_mode_enabled = false;
-                state.status = "Plan mode disabled.".to_string();
-                if cmd_tx
-                    .blocking_send(agent_event::AgentCommand::SetPlanMode { enabled: false })
-                    .is_err()
-                {
-                    state.status = "Agent channel closed.".to_string();
-                }
+                set_plan_mode(state, cmd_tx, false);
             } else {
                 let task = input
                     .strip_prefix("/plan")
                     .map(str::trim)
                     .unwrap_or_default();
                 if task.is_empty() {
-                    state.plan_mode_enabled = true;
-                    state.status = "Plan mode enabled.".to_string();
-                    if cmd_tx
-                        .blocking_send(agent_event::AgentCommand::SetPlanMode { enabled: true })
-                        .is_err()
-                    {
-                        state.status = "Agent channel closed.".to_string();
-                    }
+                    set_plan_mode(state, cmd_tx, true);
                 } else {
                     state.messages.push(ChatMessage {
                         role: "user".to_string(),
@@ -826,14 +835,7 @@ pub(crate) fn handle_slash_command(
             }
         }
         "/act" => {
-            state.plan_mode_enabled = false;
-            state.status = "Plan mode disabled.".to_string();
-            if cmd_tx
-                .blocking_send(agent_event::AgentCommand::SetPlanMode { enabled: false })
-                .is_err()
-            {
-                state.status = "Agent channel closed.".to_string();
-            }
+            set_plan_mode(state, cmd_tx, false);
         }
         "/help" => {
             state.status =
@@ -1070,6 +1072,21 @@ mod tests {
         assert!(status.contains("last in/out 123/456"));
         assert!(status.contains("cache hit 81% (100/123)"));
         assert!(status.contains("reasoning 42"));
+    }
+
+    #[test]
+    fn ready_status_names_mode_and_switch_shortcut() {
+        let mut state = AppState::new();
+        state.status = "Ready.".to_string();
+
+        let agent_status = input_status_text(&state);
+        assert!(agent_status.contains("Agent mode"));
+        assert!(agent_status.contains("Shift+Tab"));
+
+        state.plan_mode_enabled = true;
+        let plan_status = input_status_text(&state);
+        assert!(plan_status.contains("Plan mode"));
+        assert!(plan_status.contains("Shift+Tab"));
     }
 
     #[test]

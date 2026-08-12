@@ -204,7 +204,7 @@ pub async fn run(
                 let status = if enabled {
                     "Plan mode enabled. New tasks will require plan approval before execution."
                 } else {
-                    "Plan mode disabled. New tasks will execute directly."
+                    "Agent mode enabled. New tasks will execute directly."
                 };
                 let _ = event_tx.send(AgentEvent::StatusUpdate {
                     message: status.to_string(),

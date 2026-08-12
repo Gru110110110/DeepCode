@@ -255,6 +255,7 @@ deepcode run "向我解释这个代码库"
 | `Ctrl+C` | 退出 DeepCode |
 | `Esc` | 中断当前工作；拒绝当前提示 |
 | `Enter` | 发送输入或接受当前选中的提示操作 |
+| `Shift+Tab` | 在 Agent 模式（直接执行）和 Plan 模式之间切换 |
 | `Left` / `Right` / `Tab` | 在权限、计划或文件预览提示中切换选项 |
 | `Shift+Up` / `Shift+Down` 或 `Alt+Up` / `Alt+Down` | 滚动对话记录 |
 | `PageUp` / `PageDown` | 按页滚动对话记录 |

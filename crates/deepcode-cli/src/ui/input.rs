@@ -289,6 +289,14 @@ pub(crate) fn handle_key(
     }
 
     match key.code {
+        KeyCode::BackTab => {
+            let enabled = !s.plan_mode_enabled;
+            super::events::set_plan_mode(&mut s, cmd_tx, enabled);
+        }
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            let enabled = !s.plan_mode_enabled;
+            super::events::set_plan_mode(&mut s, cmd_tx, enabled);
+        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             s.running = false;
             return Ok(false);
@@ -728,6 +736,94 @@ mod tests {
     use super::*;
     use crate::ui::{PendingPermission, PendingPlanApproval};
     use deepcode_permissions::policy::ApprovalScope;
+
+    #[test]
+    fn shift_tab_toggles_between_plan_and_agent_modes() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let (cmd_tx, mut cmd_rx) = agent_event::cmd_channel(4);
+
+        handle_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &cmd_tx,
+            &state,
+        )
+        .unwrap();
+
+        {
+            let state = state.lock().unwrap();
+            assert!(state.plan_mode_enabled);
+            assert!(state.status.contains("Plan mode"));
+        }
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(agent_event::AgentCommand::SetPlanMode { enabled: true })
+        ));
+
+        handle_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &cmd_tx,
+            &state,
+        )
+        .unwrap();
+
+        {
+            let state = state.lock().unwrap();
+            assert!(!state.plan_mode_enabled);
+            assert!(state.status.contains("Agent mode"));
+        }
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(agent_event::AgentCommand::SetPlanMode { enabled: false })
+        ));
+    }
+
+    #[test]
+    fn shift_tab_does_not_change_mode_during_plan_review() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        {
+            let mut state = state.lock().unwrap();
+            state.pending_plan = Some(PendingPlanApproval {
+                request_id: "plan_1".to_string(),
+                plan: "1. Inspect".to_string(),
+                selected: PlanChoice::Approve,
+            });
+        }
+        let (cmd_tx, mut cmd_rx) = agent_event::cmd_channel(4);
+
+        handle_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &cmd_tx,
+            &state,
+        )
+        .unwrap();
+
+        let state = state.lock().unwrap();
+        assert!(!state.plan_mode_enabled);
+        assert!(state.pending_plan.is_some());
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn shift_tab_does_not_change_mode_while_agent_is_working() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        {
+            let mut state = state.lock().unwrap();
+            state.working_since = Some(std::time::Instant::now());
+        }
+        let (cmd_tx, mut cmd_rx) = agent_event::cmd_channel(4);
+
+        handle_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &cmd_tx,
+            &state,
+        )
+        .unwrap();
+
+        let state = state.lock().unwrap();
+        assert!(!state.plan_mode_enabled);
+        assert!(state.status.contains("interrupt before switching"));
+        assert!(cmd_rx.try_recv().is_err());
+    }
 
     #[test]
     fn char_boundary_helpers_handle_multibyte_input() {

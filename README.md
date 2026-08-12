@@ -313,6 +313,7 @@ not require approval are exposed.
 | `Ctrl+C` | Exit DeepCode |
 | `Esc` | Interrupt current work; reject active prompts |
 | `Enter` | Send input or accept the selected prompt action |
+| `Shift+Tab` | Toggle between Agent mode (direct execution) and Plan mode |
 | `Left` / `Right` / `Tab` | Change selection in permission, plan, or file preview prompts |
 | `Shift+Up` / `Shift+Down` or `Alt+Up` / `Alt+Down` | Scroll transcript |
 | `PageUp` / `PageDown` | Scroll transcript by page |

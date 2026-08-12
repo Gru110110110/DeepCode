@@ -28,7 +28,8 @@ pub(crate) mod scrolling;
 pub(crate) use events::{tool_activity, tool_issue_status};
 
 pub(crate) const STARTUP_BANNER_WIDTH: usize = 68;
-pub(crate) const INPUT_HELP_TEXT: &str = "Ready. Input(Enter to send,Ctrl+C to exit)";
+pub(crate) const INPUT_HELP_TEXT: &str =
+    "Agent mode · Shift+Tab to switch · Enter to send · Ctrl+C to exit";
 pub(crate) const MESSAGE_GAP_LINES: usize = 1;
 const ENABLE_ALT_SCROLL_MODE: &[u8] = b"\x1b[?1007h";
 const DISABLE_ALT_SCROLL_MODE: &[u8] = b"\x1b[?1007l";
