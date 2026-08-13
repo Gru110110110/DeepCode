@@ -50,6 +50,11 @@ base_url = "https://api.deepseek.com"
 disabled = []
 max_file_size_bytes = 1048576
 
+[agents]
+max_concurrent = 3
+# default_model = "deepseek-v4-pro"
+# default_reasoning_effort = "high"
+
 [permissions]
 # policy_files = ["~/.config/deepcode/policies/default.star"]
 # write_policy_file = "~/.config/deepcode/policies/user.star"

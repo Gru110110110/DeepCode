@@ -178,6 +178,11 @@ default_permissions = "project-edit"
 disabled = []
 max_file_size_bytes = 1048576
 
+[agents]
+max_concurrent = 3
+# default_model = "gpt-5.4"
+# default_reasoning_effort = "high"
+
 [permissions]
 # policy_files = ["~/.config/deepcode/policies/default.star"]
 # write_policy_file = "~/.config/deepcode/policies/user.star"
@@ -223,6 +228,10 @@ justification = "Restoring files can overwrite local work."
 
 - `disabled` skips matching built-in tools when the registry is created.
 - `max_file_size_bytes` applies to `read_file`, `write_file`, and `edit_file`.
+- `agents.max_concurrent` limits concurrently running subagents. Explorers can
+  run in parallel; workers are serialized to protect the shared workspace.
+- Subagents inherit `/model` and `/effort` by default. Agent defaults and
+  per-task `model`/`reasoning_effort` overrides take precedence when provided.
 - Permission profiles combine filesystem, network, shell, and tool rules into
   `allow`, `prompt`, and `deny` decisions.
 - Interactive approvals can be granted once, for the session, or persistently.
@@ -400,7 +409,15 @@ DEEPCODE_STATE_DIR=/tmp/deepcode-state deepcode chat
 | `git_commit` | Create a git commit | Safe mutation |
 | `git_checkout` | Checkout branches or restore files | Destructive |
 | `git_branch` | List, create, or delete branches | Safe mutation |
-| `agent` | Spawn a subagent with a fresh conversation context | Safe mutation |
+| `spawn_agent` | Start a background explorer or worker and return its task ID | Read-only orchestration |
+| `wait_agents` | Wait for tasks and return structured results, errors, and usage | Read-only orchestration |
+| `cancel_agents` | Cancel queued or running subagents | Read-only orchestration |
+
+Explorer subagents only receive local read-only tools. Worker subagents share
+the workspace but run one at a time; parent mutations wait for them, and they
+use the normal permission, sandbox, and file-preview flow. Interrupting the
+parent cancels all children. Usage shown for a user task includes the parent and
+every subagent.
 
 File and search tools are restricted to the workspace directory where
 `deepcode` is started. Shell commands run from a workspace-validated working

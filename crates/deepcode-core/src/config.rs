@@ -14,6 +14,8 @@ pub struct DeepCodeConfig {
     #[serde(default)]
     pub tools: ToolsConfig,
     #[serde(default)]
+    pub agents: AgentsConfig,
+    #[serde(default)]
     pub permissions: PermissionsConfig,
 }
 
@@ -86,6 +88,7 @@ impl DeepCodeConfig {
             )));
         }
         self.tools.validate()?;
+        self.agents.validate()?;
         self.permissions
             .validate(self.default_permissions.as_deref())?;
 
@@ -349,6 +352,47 @@ pub struct ToolsConfig {
     pub max_file_size_bytes: Option<usize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsConfig {
+    #[serde(default = "default_agent_concurrency")]
+    pub max_concurrent: usize,
+    pub default_model: Option<String>,
+    pub default_reasoning_effort: Option<ReasoningEffort>,
+}
+
+const fn default_agent_concurrency() -> usize {
+    3
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: default_agent_concurrency(),
+            default_model: None,
+            default_reasoning_effort: None,
+        }
+    }
+}
+
+impl AgentsConfig {
+    fn validate(&self) -> crate::error::Result<()> {
+        if self.max_concurrent == 0 {
+            return Err(config_error(
+                "agents.max_concurrent must be greater than zero",
+            ));
+        }
+        if self
+            .default_model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(config_error("agents.default_model must not be empty"));
+        }
+        Ok(())
+    }
+}
+
 impl ToolsConfig {
     fn validate(&self) -> crate::error::Result<()> {
         const KNOWN_TOOLS: &[&str] = &[
@@ -368,6 +412,9 @@ impl ToolsConfig {
             "git_checkout",
             "git_branch",
             "agent",
+            "spawn_agent",
+            "wait_agents",
+            "cancel_agents",
         ];
         if let Some(unknown) = self
             .disabled
@@ -767,6 +814,42 @@ mod tests {
         assert_eq!(name, "deepseek");
         assert_eq!(provider.model.as_deref(), Some("deepseek-v4-pro"));
         assert!(provider.models.contains_key("private-model"));
+    }
+
+    #[test]
+    fn agent_defaults_parse_and_validate() {
+        let source = format!(
+            "{}\n[agents]\nmax_concurrent = 5\ndefault_model = \"fast-model\"\ndefault_reasoning_effort = \"high\"\n",
+            VALID
+        );
+        let config = DeepCodeConfig::parse(&source).unwrap();
+
+        assert_eq!(config.agents.max_concurrent, 5);
+        assert_eq!(config.agents.default_model.as_deref(), Some("fast-model"));
+        assert_eq!(
+            config.agents.default_reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn zero_agent_concurrency_is_rejected() {
+        let source = format!("{}\n[agents]\nmax_concurrent = 0\n", VALID);
+        let error = DeepCodeConfig::parse(&source).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("agents.max_concurrent must be greater than zero"));
+    }
+
+    #[test]
+    fn whitespace_agent_default_model_is_rejected() {
+        let source = format!("{}\n[agents]\ndefault_model = \"   \"\n", VALID);
+        let error = DeepCodeConfig::parse(&source).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("agents.default_model must not be empty"));
     }
 
     #[test]

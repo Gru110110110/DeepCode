@@ -18,7 +18,9 @@ use crate::llm_response::{
 use crate::permission_handler::{
     resolve_permission, wait_for_file_preview_response, FilePreviewOutcome, PermissionResolution,
 };
-use crate::r#loop::{handle_busy_command, BusyControl};
+use crate::r#loop::{
+    handle_busy_command, wait_for_uncollected_subagents, BusyControl, SubagentBarrier,
+};
 use crate::state::{AgentPhase, AgentState, ToolResultEntry};
 use crate::validation::invalid_tool_input_message;
 
@@ -363,6 +365,7 @@ pub(crate) async fn execute_turn(
     cmd_rx: &mut CmdReceiver,
     event_tx: &EventSender,
     state: &mut AgentState,
+    task_manager: Option<Arc<crate::subagent::AgentTaskManager>>,
 ) -> TurnResult {
     let mut tool_call_count = 0usize;
     let mut interrupted = false;
@@ -383,6 +386,36 @@ pub(crate) async fn execute_turn(
             "Agent turn started"
         );
 
+        match wait_for_uncollected_subagents(task_manager.as_ref(), cmd_rx, event_tx, |count| {
+            format!("Waiting for {count} outstanding subagent task(s)...")
+        })
+        .await
+        {
+            SubagentBarrier::Clear => {}
+            SubagentBarrier::Completed(results) => {
+                let rendered = serde_json::to_string(&results)
+                    .unwrap_or_else(|error| format!("serialization failed: {error}"));
+                state.push_user(&format!(
+                    "Subagents have finished. Their structured results are below. Review them before continuing; retry only when the reported error makes that useful.\n\n{}",
+                    rendered
+                ));
+                send_session_updated(event_tx, state);
+            }
+            SubagentBarrier::Interrupted => {
+                interrupted = true;
+                break;
+            }
+            SubagentBarrier::Shutdown => {
+                shutdown_requested = true;
+                break;
+            }
+            SubagentBarrier::Failed(message) => {
+                let _ = event_tx.send(AgentEvent::AgentError { message });
+                state.phase = AgentPhase::Error;
+                break;
+            }
+        }
+
         // 1. Context compression check
         let compressor = llm.context_compressor();
         let token_estimate = compressor.estimate_tokens(&state.messages);
@@ -400,10 +433,30 @@ pub(crate) async fn execute_turn(
                 target_tokens = target,
                 "Compressing context"
             );
-            match compressor
-                .compress(&state.messages, token_estimate, target)
-                .await
-            {
+            let messages_to_compress = state.messages.clone();
+            let compress_future =
+                compressor.compress(&messages_to_compress, token_estimate, target);
+            tokio::pin!(compress_future);
+            let compressed_result = loop {
+                tokio::select! {
+                    result = &mut compress_future => break Some(result),
+                    cmd = cmd_rx.recv() => match handle_busy_command(cmd, event_tx) {
+                        BusyControl::Continue => {}
+                        BusyControl::Interrupt => {
+                            interrupted = true;
+                            break None;
+                        }
+                        BusyControl::Shutdown => {
+                            shutdown_requested = true;
+                            break None;
+                        }
+                    }
+                }
+            };
+            let Some(compressed_result) = compressed_result else {
+                break;
+            };
+            match compressed_result {
                 Ok((compressed, new_tokens)) => {
                     tracing::info!(
                         "Compressed context: {} -> {} tokens ({} messages -> {})",
@@ -842,6 +895,32 @@ pub(crate) async fn execute_turn(
                 }
             }
 
+            if !safety.is_read_only {
+                if let Some(manager) = &task_manager {
+                    let worker_barrier = manager.wait_for_workers_idle();
+                    tokio::pin!(worker_barrier);
+                    let workers_idle = loop {
+                        tokio::select! {
+                            () = &mut worker_barrier => break true,
+                            cmd = cmd_rx.recv() => match handle_busy_command(cmd, event_tx) {
+                                BusyControl::Continue => {}
+                                BusyControl::Interrupt => {
+                                    interrupted = true;
+                                    break false;
+                                }
+                                BusyControl::Shutdown => {
+                                    shutdown_requested = true;
+                                    break false;
+                                }
+                            }
+                        }
+                    };
+                    if !workers_idle {
+                        break;
+                    }
+                }
+            }
+
             let mut started = false;
             if !can_run_in_parallel {
                 tracing::info!(
@@ -996,7 +1075,28 @@ pub(crate) async fn execute_turn(
                 continue;
             }
 
-            let preview = match tools.preview_change(tool_name, tool_input.clone()).await {
+            let preview_future = tools.preview_change(tool_name, tool_input.clone());
+            tokio::pin!(preview_future);
+            let preview_result = loop {
+                tokio::select! {
+                    result = &mut preview_future => break Some(result),
+                    cmd = cmd_rx.recv() => match handle_busy_command(cmd, event_tx) {
+                        BusyControl::Continue => {}
+                        BusyControl::Interrupt => {
+                            interrupted = true;
+                            break None;
+                        }
+                        BusyControl::Shutdown => {
+                            shutdown_requested = true;
+                            break None;
+                        }
+                    }
+                }
+            };
+            let Some(preview_result) = preview_result else {
+                break;
+            };
+            let preview = match preview_result {
                 Ok(preview) => preview,
                 Err(e) => {
                     flush_parallel_tool_calls(
@@ -1144,10 +1244,29 @@ pub(crate) async fn execute_turn(
                 }
 
                 state.phase = AgentPhase::ExecutingTools;
-                match tools
-                    .execute_previewed(tool_name, tool_input.clone(), preview)
-                    .await
-                {
+                let preview_execute_future =
+                    tools.execute_previewed(tool_name, tool_input.clone(), preview);
+                tokio::pin!(preview_execute_future);
+                let preview_execute_result = loop {
+                    tokio::select! {
+                        result = &mut preview_execute_future => break Some(result),
+                        cmd = cmd_rx.recv() => match handle_busy_command(cmd, event_tx) {
+                            BusyControl::Continue => {}
+                            BusyControl::Interrupt => {
+                                interrupted = true;
+                                break None;
+                            }
+                            BusyControl::Shutdown => {
+                                shutdown_requested = true;
+                                break None;
+                            }
+                        }
+                    }
+                };
+                let Some(preview_execute_result) = preview_execute_result else {
+                    break;
+                };
+                match preview_execute_result {
                     Ok(result) => {
                         tracing::info!(
                             turn = turn + 1,

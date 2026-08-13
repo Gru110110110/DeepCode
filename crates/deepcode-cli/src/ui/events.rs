@@ -4,9 +4,9 @@ use std::time::Instant;
 use deepcode_agent::event::{self as agent_event, AgentEvent};
 
 use super::{
-    AppState, ChatMessage, FilePreviewChoice, PendingFilePreview, PendingPermission,
-    PendingPlanApproval, PendingSessionPicker, PermissionChoice, PlanChoice, TuiAction, TurnUsage,
-    INPUT_HELP_TEXT,
+    AppState, ChatMessage, DeferredApproval, FilePreviewChoice, PendingFilePreview,
+    PendingPermission, PendingPlanApproval, PendingSessionPicker, PermissionChoice, PlanChoice,
+    TuiAction, TurnUsage, INPUT_HELP_TEXT,
 };
 
 pub(crate) fn input_status_text(state: &AppState) -> String {
@@ -64,6 +64,66 @@ pub(crate) fn set_plan_mode(state: &mut AppState, cmd_tx: &agent_event::CmdSende
     {
         state.plan_mode_enabled = previous;
         state.status = "Agent channel closed; mode was not changed.".to_string();
+    }
+}
+
+fn approval_active(state: &AppState) -> bool {
+    state.pending_permission.is_some()
+        || state.pending_file_preview.is_some()
+        || state.pending_plan.is_some()
+}
+
+fn enqueue_permission(state: &mut AppState, pending: PendingPermission, child: bool) {
+    if approval_active(state) {
+        state
+            .deferred_approvals
+            .push_back(DeferredApproval::Permission(pending));
+        return;
+    }
+    let tool_name = pending.tool_name.clone();
+    state.pending_permission = Some(pending);
+    state.status = if child {
+        format!("Subagent permission required: {}", tool_name)
+    } else {
+        format!("Permission required: {}", tool_name)
+    };
+}
+
+fn enqueue_file_preview(
+    state: &mut AppState,
+    tool_name: String,
+    pending: PendingFilePreview,
+    child: bool,
+) {
+    if approval_active(state) {
+        state
+            .deferred_approvals
+            .push_back(DeferredApproval::FilePreview { tool_name, pending });
+        return;
+    }
+    state.pending_file_preview = Some(pending);
+    state.status = if child {
+        format!("Review subagent changes: {}", tool_name)
+    } else {
+        format!("Review changes: {}", tool_name)
+    };
+}
+
+pub(crate) fn activate_next_approval(state: &mut AppState) {
+    if approval_active(state) {
+        return;
+    }
+    match state.deferred_approvals.pop_front() {
+        Some(DeferredApproval::Permission(pending)) => {
+            let tool_name = pending.tool_name.clone();
+            state.pending_permission = Some(pending);
+            state.status = format!("Permission required: {}", tool_name);
+        }
+        Some(DeferredApproval::FilePreview { tool_name, pending }) => {
+            state.pending_file_preview = Some(pending);
+            state.status = format!("Review changes: {}", tool_name);
+        }
+        None => {}
     }
 }
 
@@ -245,7 +305,7 @@ fn human_tool_name(name: &str) -> String {
         "git_branch" => "git branch".to_string(),
         "web_fetch" => "web fetch".to_string(),
         "web_search" => "web search".to_string(),
-        "agent" => "subagent".to_string(),
+        "agent" | "spawn_agent" | "wait_agents" | "cancel_agents" => "subagent".to_string(),
         _ => name.replace('_', " "),
     }
 }
@@ -351,10 +411,12 @@ pub(crate) fn tool_activity(name: &str, input: &serde_json::Value) -> (&'static 
             "Browsed",
             truncate_single_line(json_str(input, "query").unwrap_or("Search web"), 96),
         ),
-        "agent" => (
+        "agent" | "spawn_agent" => (
             "Delegated",
             truncate_single_line(json_str(input, "task").unwrap_or("Run subagent"), 96),
         ),
+        "wait_agents" => ("Delegated", "Wait for subagent results".to_string()),
+        "cancel_agents" => ("Delegated", "Cancel subagents".to_string()),
         _ => ("Used Tool", format!("{} {}", name, preview_json(input, 96))),
     }
 }
@@ -385,7 +447,10 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
         }
         AgentEvent::ToolCallStarted { name, input, .. } => {
             s.finish_reasoning();
-            if name == "agent" {
+            if matches!(
+                name.as_str(),
+                "agent" | "spawn_agent" | "wait_agents" | "cancel_agents"
+            ) {
                 flush_streaming_text(&mut s);
                 if let Err(error) = s.persist_session() {
                     s.status = format!("Could not save session: {}", error);
@@ -412,14 +477,17 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
         } => {
             s.finish_reasoning();
             flush_streaming_text(&mut s);
-            s.pending_permission = Some(PendingPermission {
-                request_id,
-                tool_name: tool_name.clone(),
-                input,
-                evaluation: Some(evaluation),
-                selected: PermissionChoice::AllowOnce,
-            });
-            s.status = format!("Permission required: {}", tool_name);
+            enqueue_permission(
+                &mut s,
+                PendingPermission {
+                    request_id,
+                    tool_name: tool_name.clone(),
+                    input,
+                    evaluation: Some(evaluation),
+                    selected: PermissionChoice::AllowOnce,
+                },
+                false,
+            );
             if let Err(error) = s.persist_session() {
                 s.status = format!("Could not save session: {}", error);
             }
@@ -442,12 +510,16 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
                 role: "diff".to_string(),
                 content,
             });
-            s.pending_file_preview = Some(PendingFilePreview {
-                request_id,
-                preview,
-                selected: FilePreviewChoice::Apply,
-            });
-            s.status = format!("Review changes: {}", tool_name);
+            enqueue_file_preview(
+                &mut s,
+                tool_name.clone(),
+                PendingFilePreview {
+                    request_id,
+                    preview,
+                    selected: FilePreviewChoice::Apply,
+                },
+                false,
+            );
             if let Err(error) = s.persist_session() {
                 s.status = format!("Could not save session: {}", error);
             }
@@ -487,7 +559,11 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
                 reasoning_output_tokens,
             };
             if usage.has_reported_tokens() {
-                s.last_usage = Some(usage);
+                if let Some(total) = s.last_usage.as_mut() {
+                    total.add_assign(&usage);
+                } else {
+                    s.last_usage = Some(usage);
+                }
             }
         }
         AgentEvent::AgentFinished { .. } => {
@@ -498,6 +574,7 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
             s.pending_plan = None;
             s.pending_permission = None;
             s.pending_file_preview = None;
+            s.deferred_approvals.clear();
             s.status = "Ready.".to_string();
             if let Err(error) = s.persist_session() {
                 s.status = format!("Could not save session: {}", error);
@@ -511,6 +588,7 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
             s.pending_plan = None;
             s.pending_permission = None;
             s.pending_file_preview = None;
+            s.deferred_approvals.clear();
             s.status = "Interrupted.".to_string();
             if let Err(error) = s.persist_session() {
                 s.status = format!("Could not save session: {}", error);
@@ -524,6 +602,7 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
             s.pending_plan = None;
             s.pending_permission = None;
             s.pending_file_preview = None;
+            s.deferred_approvals.clear();
             s.messages.push(ChatMessage {
                 role: "error".to_string(),
                 content: format!("Error: {}", message),
@@ -582,6 +661,76 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
             }
             AgentEvent::AgentError { message } => {
                 s.status = truncate_chars(&format!("Subagent issue: {}", message), 180);
+            }
+            AgentEvent::TurnComplete {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                cache_miss_input_tokens,
+                reasoning_output_tokens,
+            } => {
+                let usage = TurnUsage {
+                    input_tokens: *input_tokens,
+                    output_tokens: *output_tokens,
+                    cached_input_tokens: *cached_input_tokens,
+                    cache_miss_input_tokens: *cache_miss_input_tokens,
+                    reasoning_output_tokens: *reasoning_output_tokens,
+                };
+                if usage.has_reported_tokens() {
+                    if let Some(total) = s.last_usage.as_mut() {
+                        total.add_assign(&usage);
+                    } else {
+                        s.last_usage = Some(usage);
+                    }
+                }
+            }
+            AgentEvent::PermissionNeeded {
+                request_id,
+                tool_name,
+                input,
+                evaluation,
+            } => {
+                s.finish_reasoning();
+                flush_streaming_text(&mut s);
+                enqueue_permission(
+                    &mut s,
+                    PendingPermission {
+                        request_id: request_id.clone(),
+                        tool_name: tool_name.clone(),
+                        input: input.clone(),
+                        evaluation: Some(evaluation.clone()),
+                        selected: PermissionChoice::AllowOnce,
+                    },
+                    true,
+                );
+            }
+            AgentEvent::FileChangePreviewNeeded {
+                request_id,
+                tool_name,
+                preview,
+                ..
+            } => {
+                s.finish_reasoning();
+                flush_streaming_text(&mut s);
+                let operation = if preview.before_exists {
+                    "Update"
+                } else {
+                    "Create"
+                };
+                s.messages.push(ChatMessage {
+                    role: "diff".to_string(),
+                    content: format!("{operation}: {}\n{}", preview.path, preview.unified_diff),
+                });
+                enqueue_file_preview(
+                    &mut s,
+                    tool_name.clone(),
+                    PendingFilePreview {
+                        request_id: request_id.clone(),
+                        preview: preview.clone(),
+                        selected: FilePreviewChoice::Apply,
+                    },
+                    true,
+                );
             }
             AgentEvent::PermissionsSnapshot { .. } => {}
             _ => {}
@@ -692,7 +841,7 @@ pub(crate) fn handle_slash_command(
                     .join(", ");
                 state.status = format!("Current model: {}. Available: {}", current, choices);
             } else if parts.len() == 2 && parts[1] == "refresh" {
-                refresh_models(state);
+                refresh_models(state, cmd_tx);
             } else if parts.len() != 2 {
                 state.status = "Usage: /model <name|refresh>".to_string();
             } else if state.working_since.is_some() {
@@ -816,6 +965,7 @@ pub(crate) fn handle_slash_command(
                         .core_messages
                         .push(deepcode_core::types::Message::user(task));
                     state.streaming_text.clear();
+                    state.last_usage = None;
                     state.working_since = Some(std::time::Instant::now());
                     state.interrupt_requested = false;
                     state.status = "Planning...".to_string();
@@ -856,7 +1006,7 @@ pub(crate) fn handle_slash_command(
     true
 }
 
-fn refresh_models(state: &mut AppState) {
+fn refresh_models(state: &mut AppState, cmd_tx: &agent_event::CmdSender) {
     if state.working_since.is_some()
         || state.pending_plan.is_some()
         || state.pending_permission.is_some()
@@ -901,6 +1051,15 @@ fn refresh_models(state: &mut AppState) {
                 }
             }
             let count = catalog.models.len();
+            if cmd_tx
+                .blocking_send(agent_event::AgentCommand::SetAvailableModels {
+                    models: catalog.models.clone(),
+                })
+                .is_err()
+            {
+                state.status = "Model catalog refreshed, but the agent channel closed.".to_string();
+                return;
+            }
             state.available_models = catalog.models;
             state.status = if catalog.status.stale {
                 format!("Model refresh used stale data; {} models available.", count)
@@ -1072,6 +1231,74 @@ mod tests {
         assert!(status.contains("last in/out 123/456"));
         assert!(status.contains("cache hit 81% (100/123)"));
         assert!(status.contains("reasoning 42"));
+    }
+
+    #[test]
+    fn parent_and_subagent_usage_are_accumulated() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let usage_event = AgentEvent::TurnComplete {
+            input_tokens: 10,
+            output_tokens: 2,
+            cached_input_tokens: 3,
+            cache_miss_input_tokens: 7,
+            reasoning_output_tokens: 1,
+        };
+
+        handle_agent_event(usage_event.clone(), &state);
+        handle_agent_event(
+            AgentEvent::SubagentEvent {
+                task_id: "child".to_string(),
+                event: Arc::new(usage_event),
+            },
+            &state,
+        );
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.last_usage,
+            Some(TurnUsage {
+                input_tokens: 20,
+                output_tokens: 4,
+                cached_input_tokens: 6,
+                cache_miss_input_tokens: 14,
+                reasoning_output_tokens: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn concurrent_permission_requests_are_queued() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        for request_id in ["parent", "child"] {
+            handle_agent_event(
+                AgentEvent::PermissionNeeded {
+                    request_id: request_id.to_string(),
+                    tool_name: "shell".to_string(),
+                    input: serde_json::json!({"command":"true"}),
+                    evaluation: sample_permission_evaluation(),
+                },
+                &state,
+            );
+        }
+
+        let mut state = state.lock().unwrap();
+        assert_eq!(
+            state
+                .pending_permission
+                .as_ref()
+                .map(|item| item.request_id.as_str()),
+            Some("parent")
+        );
+        assert_eq!(state.deferred_approvals.len(), 1);
+        state.pending_permission = None;
+        activate_next_approval(&mut state);
+        assert_eq!(
+            state
+                .pending_permission
+                .as_ref()
+                .map(|item| item.request_id.as_str()),
+            Some("child")
+        );
     }
 
     #[test]
@@ -1321,6 +1548,13 @@ mod tests {
     #[test]
     fn slash_plan_with_task_sends_one_shot_plan_process() {
         let mut state = AppState::new();
+        state.last_usage = Some(TurnUsage {
+            input_tokens: 99,
+            output_tokens: 9,
+            cached_input_tokens: 0,
+            cache_miss_input_tokens: 99,
+            reasoning_output_tokens: 0,
+        });
         let (cmd_tx, mut cmd_rx) = agent_event::cmd_channel(4);
 
         assert!(handle_slash_command(
@@ -1330,6 +1564,7 @@ mod tests {
         ));
 
         assert!(!state.plan_mode_enabled);
+        assert!(state.last_usage.is_none());
         assert_eq!(state.messages[0].content, "update parser");
         match cmd_rx.try_recv().unwrap() {
             agent_event::AgentCommand::PlanProcess { message } => {

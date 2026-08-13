@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 
 /// Commands sent from the UI/cli to the agent loop.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AgentCommand {
     /// Start processing a user message.
     Process { message: String },
@@ -14,6 +14,10 @@ pub enum AgentCommand {
         model: String,
         max_tokens: usize,
         context_window: usize,
+    },
+    /// Replace the live model catalog used to validate subagent overrides.
+    SetAvailableModels {
+        models: Vec<deepcode_core::config::ModelProfile>,
     },
     /// Change reasoning depth used by subsequent requests. `None` disables it.
     SetReasoningEffort { effort: Option<String> },

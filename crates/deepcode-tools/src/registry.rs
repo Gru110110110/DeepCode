@@ -79,6 +79,27 @@ impl ToolRegistry {
         definitions
     }
 
+    /// A registry containing only local, approval-free read-only tools.
+    /// Orchestration tools are excluded so child agents cannot recursively spawn agents.
+    pub fn read_only_subset(&self) -> Self {
+        let tools = self
+            .tools
+            .iter()
+            .filter(|(name, tool)| {
+                let safety = tool.safety();
+                safety.is_read_only
+                    && !safety.requires_approval
+                    && !safety.is_destructive
+                    && !matches!(
+                        name.as_str(),
+                        "spawn_agent" | "wait_agents" | "cancel_agents"
+                    )
+            })
+            .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
+            .collect();
+        Self { tools }
+    }
+
     /// Execute a tool by name with JSON input.
     pub async fn execute(&self, name: &str, input: serde_json::Value) -> Result<String> {
         self.execute_with_context(name, input, ToolExecutionContext::default())
@@ -241,5 +262,18 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["grep", "read_file"]);
+    }
+
+    #[test]
+    fn read_only_subset_excludes_mutations_and_recursive_orchestration() {
+        let mut registry = ToolRegistry::new();
+        registry.register(NamedTool::new("read_file"));
+        registry.register(NamedTool::mutating("edit_file"));
+        registry.register(NamedTool::new("spawn_agent"));
+        registry.register(NamedTool::new("wait_agents"));
+
+        let subset = registry.read_only_subset();
+
+        assert_eq!(subset.names(), vec!["read_file"]);
     }
 }

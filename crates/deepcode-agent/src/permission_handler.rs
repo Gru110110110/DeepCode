@@ -35,6 +35,9 @@ pub(crate) async fn wait_for_permission_response(
     event_tx: &EventSender,
 ) -> PermissionOutcome {
     while let Some(cmd) = cmd_rx.recv().await {
+        if crate::subagent::route_nested_command(&cmd) {
+            continue;
+        }
         match cmd {
             AgentCommand::PermissionResponse {
                 request_id: response_id,
@@ -48,7 +51,6 @@ pub(crate) async fn wait_for_permission_response(
                 };
             }
             AgentCommand::Interrupt => {
-                let _ = event_tx.send(AgentEvent::Interrupted);
                 return PermissionOutcome::Interrupted;
             }
             AgentCommand::Shutdown => return PermissionOutcome::Shutdown,
@@ -56,6 +58,7 @@ pub(crate) async fn wait_for_permission_response(
             | AgentCommand::PlanProcess { .. }
             | AgentCommand::SetPlanMode { .. }
             | AgentCommand::SetModel { .. }
+            | AgentCommand::SetAvailableModels { .. }
             | AgentCommand::SetReasoningEffort { .. }
             | AgentCommand::ClearSession
             | AgentCommand::PermissionsSnapshot => {
@@ -78,6 +81,9 @@ pub(crate) async fn wait_for_file_preview_response(
     event_tx: &EventSender,
 ) -> FilePreviewOutcome {
     while let Some(cmd) = cmd_rx.recv().await {
+        if crate::subagent::route_nested_command(&cmd) {
+            continue;
+        }
         match cmd {
             AgentCommand::FileChangePreviewResponse {
                 request_id: response_id,
@@ -90,7 +96,6 @@ pub(crate) async fn wait_for_file_preview_response(
                 };
             }
             AgentCommand::Interrupt => {
-                let _ = event_tx.send(AgentEvent::Interrupted);
                 return FilePreviewOutcome::Interrupted;
             }
             AgentCommand::Shutdown => return FilePreviewOutcome::Shutdown,
@@ -98,6 +103,7 @@ pub(crate) async fn wait_for_file_preview_response(
             | AgentCommand::PlanProcess { .. }
             | AgentCommand::SetPlanMode { .. }
             | AgentCommand::SetModel { .. }
+            | AgentCommand::SetAvailableModels { .. }
             | AgentCommand::SetReasoningEffort { .. }
             | AgentCommand::ClearSession
             | AgentCommand::PermissionsSnapshot => {

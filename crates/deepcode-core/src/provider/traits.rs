@@ -601,13 +601,37 @@ pub enum FinishReason {
     ContentFilter,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub cached_input_tokens: usize,
     pub cache_miss_input_tokens: usize,
     pub reasoning_output_tokens: usize,
+}
+
+impl Usage {
+    pub fn has_reported_tokens(&self) -> bool {
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cached_input_tokens > 0
+            || self.cache_miss_input_tokens > 0
+            || self.reasoning_output_tokens > 0
+    }
+
+    pub fn add_assign(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cache_miss_input_tokens = self
+            .cache_miss_input_tokens
+            .saturating_add(other.cache_miss_input_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(other.reasoning_output_tokens);
+    }
 }
 
 #[cfg(test)]

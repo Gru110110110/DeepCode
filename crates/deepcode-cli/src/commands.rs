@@ -69,23 +69,26 @@ fn permissions_config(config: &DeepCodeConfig) -> PermissionSystemConfig {
     }
 }
 
-fn register_subagent_tool(
+fn register_subagent_tools(
     registry: &mut ToolRegistry,
-    llm: Arc<dyn LlmProvider>,
-    permissions: Arc<tokio::sync::Mutex<PermissionSystem>>,
-    model: String,
-    model_config: (usize, usize),
-    event_tx: event::EventSender,
+    manager: Arc<deepcode_agent::subagent::AgentTaskManager>,
+    tools_config: &deepcode_core::config::ToolsConfig,
 ) {
-    let subagent_tool = Arc::new(deepcode_agent::subagent::SubagentTool::new(
-        llm,
-        Arc::new(registry.clone()),
-        permissions,
-        model,
-        model_config,
-        event_tx,
-    ));
-    registry.register(subagent_tool);
+    if tool_enabled(tools_config, "spawn_agent") {
+        registry.register(Arc::new(deepcode_agent::subagent::SpawnAgentTool::new(
+            Arc::clone(&manager),
+        )));
+    }
+    if tool_enabled(tools_config, "wait_agents") {
+        registry.register(Arc::new(deepcode_agent::subagent::WaitAgentsTool::new(
+            Arc::clone(&manager),
+        )));
+    }
+    if tool_enabled(tools_config, "cancel_agents") {
+        registry.register(Arc::new(deepcode_agent::subagent::CancelAgentsTool::new(
+            manager,
+        )));
+    }
 }
 
 fn tool_enabled(tools_config: &deepcode_core::config::ToolsConfig, name: &str) -> bool {
@@ -95,10 +98,20 @@ fn tool_enabled(tools_config: &deepcode_core::config::ToolsConfig, name: &str) -
         .any(|disabled| disabled == name)
 }
 
-fn build_system_prompt(model: &str) -> String {
+fn build_system_prompt(model: &str, subagents_enabled: bool) -> String {
     let directory = std::env::current_dir()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
+
+    let delegation = if subagents_enabled {
+        "For independent investigations, start multiple explorer tasks with \
+         spawn_agent. When wait_agents is available, call it once with all task IDs; \
+         otherwise the runtime will collect outstanding results before the next model \
+         request. Always review those results before giving the final answer. Use \
+         worker tasks only for clearly isolated implementation work.\n\n"
+    } else {
+        ""
+    };
 
     format!(
         "You are DeepCode, an AI coding agent running in a terminal.\n\
@@ -110,10 +123,10 @@ fn build_system_prompt(model: &str) -> String {
          about this project, source code, files, git state, build status, tests, or \
          implementation details, inspect the workspace with tools before answering. \
          Prefer read-only tools first, such as glob, grep, read_file, git_status, \
-         and safe shell commands when needed.\n\n\
+         and safe shell commands when needed. {}\
          Keep responses concise, factual, and in the user's language. Explain the \
          actions you took and the findings from tools instead of guessing.",
-        model, directory
+        model, directory, delegation
     )
 }
 
@@ -235,6 +248,7 @@ pub(crate) struct AgentContext {
     pub event_tx: event::EventSender,
     cmd_rx: event::CmdReceiver,
     catalog_refresh: Option<tokio::task::JoinHandle<()>>,
+    task_manager: Option<Arc<deepcode_agent::subagent::AgentTaskManager>>,
 }
 
 impl AgentContext {
@@ -247,20 +261,38 @@ impl AgentContext {
         let permissions_clone = self.permissions.clone();
         let catalog_refresh = self.catalog_refresh;
         let agent = tokio::spawn(async move {
-            deepcode_agent::r#loop::run(
-                self.llm,
-                self.tools,
-                permissions_clone,
-                self.model,
-                self.model_config,
-                self.reasoning_effort,
-                self.system_prompt,
-                self.initial_messages,
-                true,
-                self.cmd_rx,
-                self.event_tx,
-            )
-            .await
+            if let Some(manager) = self.task_manager {
+                deepcode_agent::r#loop::run_managed(
+                    self.llm,
+                    self.tools,
+                    permissions_clone,
+                    self.model,
+                    self.model_config,
+                    self.reasoning_effort,
+                    self.system_prompt,
+                    self.initial_messages,
+                    true,
+                    self.cmd_rx,
+                    self.event_tx,
+                    manager,
+                )
+                .await
+            } else {
+                deepcode_agent::r#loop::run(
+                    self.llm,
+                    self.tools,
+                    permissions_clone,
+                    self.model,
+                    self.model_config,
+                    self.reasoning_effort,
+                    self.system_prompt,
+                    self.initial_messages,
+                    true,
+                    self.cmd_rx,
+                    self.event_tx,
+                )
+                .await
+            }
         });
         (agent, catalog_refresh)
     }
@@ -287,19 +319,36 @@ pub(crate) async fn build_agent_context(
     let (cmd_tx, cmd_rx) = event::cmd_channel(command_channel_buffer);
     let (event_tx, event_rx) = event::event_channel();
 
-    if tool_enabled(&config.tools, "agent") {
-        register_subagent_tool(
-            &mut registry,
-            llm.clone(),
-            permissions.clone(),
-            model.clone(),
-            model_config,
-            event_tx.clone(),
-        );
-    }
+    let task_manager =
+        if tool_enabled(&config.tools, "agent") && tool_enabled(&config.tools, "spawn_agent") {
+            let settings = Arc::new(tokio::sync::RwLock::new(
+                deepcode_agent::subagent::AgentRuntimeSettings {
+                    model: model.clone(),
+                    reasoning_effort: Some(reasoning_effort.clone()),
+                    default_subagent_model: config.agents.default_model.clone(),
+                    default_subagent_reasoning_effort: config
+                        .agents
+                        .default_reasoning_effort
+                        .map(|effort| effort.to_string()),
+                },
+            ));
+            let manager = deepcode_agent::subagent::AgentTaskManager::new(
+                Arc::clone(&llm),
+                Arc::new(registry.clone()),
+                Arc::clone(&permissions),
+                settings,
+                available_models.clone(),
+                event_tx.clone(),
+                config.agents.max_concurrent,
+            );
+            register_subagent_tools(&mut registry, Arc::clone(&manager), &config.tools);
+            Some(manager)
+        } else {
+            None
+        };
     let tools = Arc::new(registry);
 
-    let system_prompt = Some(build_system_prompt(&model));
+    let system_prompt = Some(build_system_prompt(&model, task_manager.is_some()));
 
     let context = AgentContext {
         llm,
@@ -316,6 +365,7 @@ pub(crate) async fn build_agent_context(
         event_tx,
         cmd_rx,
         catalog_refresh,
+        task_manager,
     };
 
     Ok((context, event_rx))
@@ -462,7 +512,10 @@ pub(crate) async fn run_command(
                 final_output.push_str(&text);
             }
             event::AgentEvent::ToolCallStarted { name, input, .. } => {
-                if name == "agent" {
+                if matches!(
+                    name.as_str(),
+                    "agent" | "spawn_agent" | "wait_agents" | "cancel_agents"
+                ) {
                     continue;
                 }
                 let (group, detail) = crate::ui::tool_activity(&name, &input);
@@ -565,7 +618,11 @@ pub(crate) async fn run_command(
                     reasoning_output_tokens,
                 };
                 if usage.has_reported_tokens() {
-                    last_usage = Some(usage);
+                    if let Some(total) = last_usage.as_mut() {
+                        total.add_assign(&usage);
+                    } else {
+                        last_usage = Some(usage);
+                    }
                 }
             }
             event::AgentEvent::SessionUpdated { messages } => {
@@ -604,6 +661,68 @@ pub(crate) async fn run_command(
                 }
                 event::AgentEvent::AgentError { message } => {
                     eprintln!("  Subagent issue: {}", message);
+                }
+                event::AgentEvent::TurnComplete {
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                    cache_miss_input_tokens,
+                    reasoning_output_tokens,
+                } => {
+                    let usage = crate::ui::TurnUsage {
+                        input_tokens: *input_tokens,
+                        output_tokens: *output_tokens,
+                        cached_input_tokens: *cached_input_tokens,
+                        cache_miss_input_tokens: *cache_miss_input_tokens,
+                        reasoning_output_tokens: *reasoning_output_tokens,
+                    };
+                    if usage.has_reported_tokens() {
+                        if let Some(total) = last_usage.as_mut() {
+                            total.add_assign(&usage);
+                        } else {
+                            last_usage = Some(usage);
+                        }
+                    }
+                }
+                event::AgentEvent::PermissionNeeded {
+                    request_id,
+                    tool_name,
+                    input,
+                    evaluation,
+                } => {
+                    eprintln!(
+                        "\nSubagent permission required: {} ({}, {})",
+                        tool_name,
+                        evaluation.risk.as_str(),
+                        serde_json::to_string(input).unwrap_or_default()
+                    );
+                    eprint!("Allow once? [y/N] ");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    let mut line = String::new();
+                    let approved = std::io::stdin().read_line(&mut line).is_ok_and(|_| {
+                        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+                    });
+                    let _ = cmd_tx
+                        .send(event::AgentCommand::PermissionResponse {
+                            request_id: request_id.clone(),
+                            approved,
+                            scope: ApprovalScope::Once,
+                        })
+                        .await;
+                }
+                event::AgentEvent::FileChangePreviewNeeded {
+                    request_id,
+                    preview,
+                    ..
+                } => {
+                    print_colored_diff_to_stderr(preview);
+                    let approved = read_file_preview_decision();
+                    let _ = cmd_tx
+                        .send(event::AgentCommand::FileChangePreviewResponse {
+                            request_id: request_id.clone(),
+                            approved,
+                        })
+                        .await;
                 }
                 _ => {}
             },
@@ -950,7 +1069,7 @@ pub(crate) async fn chat_command(
 
 #[cfg(test)]
 mod tests {
-    use super::tool_enabled;
+    use super::{build_system_prompt, tool_enabled};
     use deepcode_core::config::ToolsConfig;
 
     #[test]
@@ -962,5 +1081,11 @@ mod tests {
 
         assert!(!tool_enabled(&tools_config, "agent"));
         assert!(tool_enabled(&tools_config, "shell"));
+    }
+
+    #[test]
+    fn system_prompt_only_mentions_subagents_when_enabled() {
+        assert!(!build_system_prompt("test-model", false).contains("spawn_agent"));
+        assert!(build_system_prompt("test-model", true).contains("spawn_agent"));
     }
 }

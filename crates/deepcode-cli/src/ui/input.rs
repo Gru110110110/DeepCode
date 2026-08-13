@@ -190,6 +190,8 @@ pub(crate) fn handle_key(
                     });
                 if send_result.is_err() {
                     s.status = "Agent channel closed.".to_string();
+                } else {
+                    super::events::activate_next_approval(&mut s);
                 }
                 return Ok(true);
             }
@@ -220,6 +222,8 @@ pub(crate) fn handle_key(
         };
         if send_result.is_err() {
             s.status = "Agent channel closed.".to_string();
+        } else {
+            super::events::activate_next_approval(&mut s);
         }
         return Ok(true);
     }
@@ -284,6 +288,8 @@ pub(crate) fn handle_key(
         };
         if send_result.is_err() {
             s.status = "Agent channel closed.".to_string();
+        } else {
+            super::events::activate_next_approval(&mut s);
         }
         return Ok(true);
     }
@@ -355,6 +361,7 @@ pub(crate) fn handle_key(
                     .push(deepcode_core::types::Message::user(&input));
                 s.scroll_to_bottom();
                 s.streaming_text.clear();
+                s.last_usage = None;
                 s.working_since = Some(std::time::Instant::now());
                 s.interrupt_requested = false;
                 s.status = if s.plan_mode_enabled {
@@ -734,7 +741,7 @@ fn take_width(value: &str, max_width: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::{PendingPermission, PendingPlanApproval};
+    use crate::ui::{DeferredApproval, PendingPermission, PendingPlanApproval};
     use deepcode_permissions::policy::ApprovalScope;
 
     #[test]
@@ -1174,6 +1181,59 @@ mod tests {
             other => panic!("unexpected command: {:?}", other),
         }
         assert!(state.lock().unwrap().pending_file_preview.is_none());
+    }
+
+    #[test]
+    fn rejecting_preview_with_escape_activates_deferred_approval() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        {
+            let mut state = state.lock().unwrap();
+            state.pending_file_preview = Some(crate::ui::PendingFilePreview {
+                request_id: "preview_1".to_string(),
+                preview: deepcode_tools::tool::FileChangePreview {
+                    path: "a.txt".to_string(),
+                    before_exists: true,
+                    before: "old\n".to_string(),
+                    after: "new\n".to_string(),
+                    unified_diff: String::new(),
+                },
+                selected: FilePreviewChoice::Apply,
+            });
+            state
+                .deferred_approvals
+                .push_back(DeferredApproval::Permission(PendingPermission {
+                    request_id: "permission_2".to_string(),
+                    tool_name: "shell".to_string(),
+                    input: serde_json::json!({"command":"true"}),
+                    evaluation: None,
+                    selected: PermissionChoice::AllowOnce,
+                }));
+        }
+        let (cmd_tx, mut cmd_rx) = agent_event::cmd_channel(4);
+
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &cmd_tx,
+            &state,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            cmd_rx.try_recv().unwrap(),
+            agent_event::AgentCommand::FileChangePreviewResponse {
+                request_id,
+                approved: false,
+            } if request_id == "preview_1"
+        ));
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state
+                .pending_permission
+                .as_ref()
+                .map(|permission| permission.request_id.as_str()),
+            Some("permission_2")
+        );
+        assert!(state.deferred_approvals.is_empty());
     }
 
     #[test]

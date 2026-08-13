@@ -16,20 +16,67 @@ pub(crate) enum BusyControl {
     Shutdown,
 }
 
+pub(crate) enum SubagentBarrier {
+    Clear,
+    Completed(Vec<crate::subagent::AgentTaskResult>),
+    Interrupted,
+    Shutdown,
+    Failed(String),
+}
+
+pub(crate) async fn wait_for_uncollected_subagents(
+    manager: Option<&Arc<crate::subagent::AgentTaskManager>>,
+    cmd_rx: &mut crate::event::CmdReceiver,
+    event_tx: &EventSender,
+    status: impl FnOnce(usize) -> String,
+) -> SubagentBarrier {
+    let Some(manager) = manager else {
+        return SubagentBarrier::Clear;
+    };
+    let task_ids = manager.uncollected_task_ids().await;
+    if task_ids.is_empty() {
+        return SubagentBarrier::Clear;
+    }
+    let _ = event_tx.send(AgentEvent::StatusUpdate {
+        message: status(task_ids.len()),
+    });
+    let wait_future = manager.wait(&task_ids);
+    tokio::pin!(wait_future);
+    loop {
+        tokio::select! {
+            result = &mut wait_future => {
+                return match result {
+                    Ok(results) => SubagentBarrier::Completed(results),
+                    Err(error) => SubagentBarrier::Failed(error.to_string()),
+                };
+            }
+            cmd = cmd_rx.recv() => match handle_busy_command(cmd, event_tx) {
+                BusyControl::Continue => {}
+                BusyControl::Interrupt => return SubagentBarrier::Interrupted,
+                BusyControl::Shutdown => return SubagentBarrier::Shutdown,
+            }
+        }
+    }
+}
+
 pub(crate) fn handle_busy_command(
     cmd: Option<AgentCommand>,
     event_tx: &EventSender,
 ) -> BusyControl {
+    if cmd
+        .as_ref()
+        .is_some_and(crate::subagent::route_nested_command)
+    {
+        return BusyControl::Continue;
+    }
     match cmd {
-        Some(AgentCommand::Interrupt) => {
-            let _ = event_tx.send(AgentEvent::Interrupted);
-            BusyControl::Interrupt
-        }
+        Some(AgentCommand::Interrupt) => BusyControl::Interrupt,
         Some(AgentCommand::Shutdown) | None => BusyControl::Shutdown,
         Some(AgentCommand::Process { .. })
         | Some(AgentCommand::PlanProcess { .. })
         | Some(AgentCommand::SetPlanMode { .. })
         | Some(AgentCommand::SetModel { .. })
+        | Some(AgentCommand::SetAvailableModels { .. })
         | Some(AgentCommand::SetReasoningEffort { .. })
         | Some(AgentCommand::ClearSession)
         | Some(AgentCommand::PermissionsSnapshot) => {
@@ -56,7 +103,11 @@ async fn process_user_message(
     state: &mut AgentState,
     message: String,
     plan_first: bool,
+    task_manager: Option<&Arc<crate::subagent::AgentTaskManager>>,
 ) -> bool {
+    if let Some(manager) = task_manager {
+        manager.reset_for_parent_turn().await;
+    }
     tracing::info!(
         message_chars = message.chars().count(),
         messages = state.messages.len(),
@@ -69,7 +120,18 @@ async fn process_user_message(
     });
 
     if plan_first {
-        match execute_plan_review(llm, tools, model, model_config, cmd_rx, event_tx, state).await {
+        match execute_plan_review(
+            llm,
+            tools,
+            model,
+            model_config,
+            cmd_rx,
+            event_tx,
+            state,
+            task_manager.cloned(),
+        )
+        .await
+        {
             PlanDecision::Approved { plan } => {
                 state.push_user(&approved_plan_instruction(&plan));
                 let _ = event_tx.send(AgentEvent::SessionUpdated {
@@ -78,6 +140,9 @@ async fn process_user_message(
             }
             PlanDecision::Rejected => {
                 tracing::info!("Plan rejected by user");
+                if let Some(manager) = task_manager {
+                    manager.cancel_all().await;
+                }
                 state.phase = AgentPhase::Idle;
                 let message = "Plan rejected.".to_string();
                 let _ = event_tx.send(AgentEvent::StatusUpdate {
@@ -90,16 +155,26 @@ async fn process_user_message(
             }
             PlanDecision::Interrupted => {
                 tracing::info!("Agent plan interrupted");
+                if let Some(manager) = task_manager {
+                    manager.interrupt_all().await;
+                }
+                let _ = event_tx.send(AgentEvent::Interrupted);
                 state.phase = AgentPhase::Idle;
                 return false;
             }
             PlanDecision::Shutdown => {
                 tracing::info!("Agent plan shutdown requested");
+                if let Some(manager) = task_manager {
+                    manager.cancel_all().await;
+                }
                 state.phase = AgentPhase::Finished;
                 return true;
             }
             PlanDecision::Failed => {
                 tracing::info!("Agent plan failed");
+                if let Some(manager) = task_manager {
+                    manager.cancel_all().await;
+                }
                 if state.phase != AgentPhase::Error {
                     state.phase = AgentPhase::Idle;
                 }
@@ -117,17 +192,30 @@ async fn process_user_message(
         cmd_rx,
         event_tx,
         state,
+        task_manager.cloned(),
     )
     .await;
 
     if result.interrupted {
         tracing::info!("Agent process interrupted");
+        if let Some(manager) = task_manager {
+            manager.interrupt_all().await;
+        }
+        let _ = event_tx.send(AgentEvent::Interrupted);
         state.phase = AgentPhase::Idle;
     }
     if result.shutdown_requested {
         tracing::info!("Agent process shutdown requested");
+        if let Some(manager) = task_manager {
+            manager.cancel_all().await;
+        }
         state.phase = AgentPhase::Finished;
         return true;
+    }
+    if state.phase == AgentPhase::Error {
+        if let Some(manager) = task_manager {
+            manager.cancel_all().await;
+        }
     }
     false
 }
@@ -149,6 +237,70 @@ pub async fn run(
     session_title_enabled: bool,
     cmd_rx: crate::event::CmdReceiver,
     event_tx: EventSender,
+) -> Result<(), DeepCodeError> {
+    run_internal(
+        llm,
+        tools,
+        permissions,
+        model,
+        model_config,
+        reasoning_effort,
+        system_prompt,
+        initial_messages,
+        session_title_enabled,
+        cmd_rx,
+        event_tx,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_managed(
+    llm: Arc<dyn LlmProvider>,
+    tools: Arc<ToolRegistry>,
+    permissions: Arc<tokio::sync::Mutex<PermissionSystem>>,
+    model: String,
+    model_config: (usize, usize),
+    reasoning_effort: Option<String>,
+    system_prompt: Option<String>,
+    initial_messages: Option<Vec<deepcode_core::types::Message>>,
+    session_title_enabled: bool,
+    cmd_rx: crate::event::CmdReceiver,
+    event_tx: EventSender,
+    task_manager: Arc<crate::subagent::AgentTaskManager>,
+) -> Result<(), DeepCodeError> {
+    run_internal(
+        llm,
+        tools,
+        permissions,
+        model,
+        model_config,
+        reasoning_effort,
+        system_prompt,
+        initial_messages,
+        session_title_enabled,
+        cmd_rx,
+        event_tx,
+        Some(task_manager),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_internal(
+    llm: Arc<dyn LlmProvider>,
+    tools: Arc<ToolRegistry>,
+    permissions: Arc<tokio::sync::Mutex<PermissionSystem>>,
+    model: String,
+    model_config: (usize, usize),
+    reasoning_effort: Option<String>,
+    system_prompt: Option<String>,
+    initial_messages: Option<Vec<deepcode_core::types::Message>>,
+    session_title_enabled: bool,
+    cmd_rx: crate::event::CmdReceiver,
+    event_tx: EventSender,
+    task_manager: Option<Arc<crate::subagent::AgentTaskManager>>,
 ) -> Result<(), DeepCodeError> {
     let mut model = model;
     let mut model_config = model_config;
@@ -172,11 +324,17 @@ pub async fn run(
         match cmd {
             AgentCommand::Shutdown => {
                 tracing::info!("Agent shutdown requested");
+                if let Some(manager) = &task_manager {
+                    manager.cancel_all().await;
+                }
                 state.phase = AgentPhase::Finished;
                 break;
             }
             AgentCommand::Interrupt => {
                 tracing::info!("Agent interrupted while idle");
+                if let Some(manager) = &task_manager {
+                    manager.interrupt_all().await;
+                }
                 let _ = event_tx.send(AgentEvent::Interrupted);
                 state.phase = AgentPhase::Idle;
             }
@@ -185,19 +343,32 @@ pub async fn run(
                 approved,
                 scope,
             } => {
-                let _ = (request_id, approved, scope);
+                let command = AgentCommand::PermissionResponse {
+                    request_id,
+                    approved,
+                    scope,
+                };
+                let _ = crate::subagent::route_nested_command(&command);
             }
             AgentCommand::PlanResponse {
                 request_id,
                 approved,
             } => {
-                let _ = (request_id, approved);
+                let command = AgentCommand::PlanResponse {
+                    request_id,
+                    approved,
+                };
+                let _ = crate::subagent::route_nested_command(&command);
             }
             AgentCommand::FileChangePreviewResponse {
                 request_id,
                 approved,
             } => {
-                let _ = (request_id, approved);
+                let command = AgentCommand::FileChangePreviewResponse {
+                    request_id,
+                    approved,
+                };
+                let _ = crate::subagent::route_nested_command(&command);
             }
             AgentCommand::SetPlanMode { enabled } => {
                 state.plan_mode_enabled = enabled;
@@ -217,12 +388,25 @@ pub async fn run(
             } => {
                 model = new_model;
                 model_config = (max_tokens, context_window);
+                if let Some(manager) = &task_manager {
+                    manager.update_main_model(model.clone()).await;
+                }
                 let _ = event_tx.send(AgentEvent::StatusUpdate {
                     message: format!("Model switched to {}.", model),
                 });
             }
+            AgentCommand::SetAvailableModels { models } => {
+                if let Some(manager) = &task_manager {
+                    manager.update_models(models).await;
+                }
+            }
             AgentCommand::SetReasoningEffort { effort } => {
                 state.reasoning_effort = effort;
+                if let Some(manager) = &task_manager {
+                    manager
+                        .update_main_reasoning_effort(state.reasoning_effort.clone())
+                        .await;
+                }
                 let label = state.reasoning_effort.as_deref().unwrap_or("off");
                 let _ = event_tx.send(AgentEvent::StatusUpdate {
                     message: format!("Reasoning effort set to {}.", label),
@@ -253,6 +437,7 @@ pub async fn run(
                     &mut state,
                     message,
                     true,
+                    task_manager.as_ref(),
                 )
                 .await
                 {
@@ -272,6 +457,7 @@ pub async fn run(
                     &mut state,
                     message,
                     plan_first,
+                    task_manager.as_ref(),
                 )
                 .await
                 {
@@ -281,6 +467,9 @@ pub async fn run(
         }
     }
 
+    if let Some(manager) = &task_manager {
+        manager.cancel_all().await;
+    }
     tracing::info!("Agent loop exited");
     Ok(())
 }
@@ -377,6 +566,15 @@ mod tests {
         compressor: TestCompressor,
     }
 
+    struct SubagentBarrierProvider {
+        parent_calls: AtomicUsize,
+        child_finished: Arc<std::sync::atomic::AtomicBool>,
+        child_delay: std::time::Duration,
+        request_builder: TestRequestBuilder,
+        response_parser: TestResponseParser,
+        compressor: TestCompressor,
+    }
+
     impl RepeatingFailureProvider {
         fn new() -> Self {
             Self {
@@ -450,6 +648,111 @@ mod tests {
 
         fn with_tool_input(tool_input_delta: &str) -> Self {
             Self::with_tool_call("echo_tool", tool_input_delta)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SubagentBarrierProvider {
+        fn name(&self) -> &str {
+            "subagent-barrier-test"
+        }
+
+        fn request_builder(&self) -> &dyn RequestBuilder {
+            &self.request_builder
+        }
+
+        fn response_parser(&self) -> &dyn ResponseParser {
+            &self.response_parser
+        }
+
+        fn context_compressor(&self) -> &dyn ContextCompressor {
+            &self.compressor
+        }
+
+        async fn generate_stream(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+            _system_prompt: Option<&str>,
+            _params: &GenerateParams,
+        ) -> CoreResult<Pin<Box<dyn Stream<Item = CoreResult<StreamDelta>> + Send>>> {
+            let is_child = messages.iter().any(|message| {
+                message.role == Role::System
+                    && message.content.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::Text { text }
+                                if text.contains("read-only code explorer")
+                        )
+                    })
+            });
+            if is_child {
+                let child_finished = Arc::clone(&self.child_finished);
+                let child_delay = self.child_delay;
+                return Ok(Box::pin(stream::once(async move {
+                    tokio::time::sleep(child_delay).await;
+                    child_finished.store(true, Ordering::SeqCst);
+                    Ok(StreamDelta::Batch(vec![
+                        StreamDelta::TextDelta("child evidence".to_string()),
+                        StreamDelta::Finished(FinishReason::Stop),
+                    ]))
+                })));
+            }
+
+            let call = self.parent_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(Box::pin(stream::iter(
+                    vec![
+                        StreamDelta::ToolUseStart {
+                            id: "spawn_1".to_string(),
+                            name: "spawn_agent".to_string(),
+                            index: None,
+                            input_delta: None,
+                        },
+                        StreamDelta::ToolUseInput {
+                            id: "spawn_1".to_string(),
+                            index: None,
+                            input_delta: "{\"task\":\"inspect\",\"role\":\"explorer\"}".to_string(),
+                        },
+                        StreamDelta::ToolUseEnd {
+                            id: "spawn_1".to_string(),
+                            index: None,
+                        },
+                        StreamDelta::Finished(FinishReason::ToolCalls),
+                    ]
+                    .into_iter()
+                    .map(Ok),
+                )));
+            }
+
+            assert!(
+                self.child_finished.load(Ordering::SeqCst),
+                "parent requested a conclusion before the child finished"
+            );
+            assert!(messages.iter().any(|message| {
+                message.role == Role::User
+                    && message.content.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::Text { text }
+                                if text.contains("Subagents have finished")
+                                    && text.contains("child evidence")
+                        )
+                    })
+            }));
+            Ok(Box::pin(stream::iter(
+                vec![
+                    StreamDelta::TextDelta("final after child".to_string()),
+                    StreamDelta::Finished(FinishReason::Stop),
+                ]
+                .into_iter()
+                .map(Ok),
+            )))
+        }
+
+        async fn send_request(&self, _body: &serde_json::Value) -> CoreResult<serde_json::Value> {
+            Ok(serde_json::json!({}))
         }
     }
 
@@ -1798,5 +2101,196 @@ mod tests {
         assert!(events.iter().any(
             |event| matches!(event, AgentEvent::AgentFinished { final_message } if final_message == "done")
         ));
+    }
+
+    #[tokio::test]
+    async fn managed_agent_waits_for_child_results_before_requesting_conclusion() {
+        let provider = Arc::new(SubagentBarrierProvider {
+            parent_calls: AtomicUsize::new(0),
+            child_finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            child_delay: std::time::Duration::from_millis(40),
+            request_builder: TestRequestBuilder,
+            response_parser: TestResponseParser,
+            compressor: TestCompressor,
+        });
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let permissions = Arc::new(tokio::sync::Mutex::new(PermissionSystem::new(
+            deepcode_permissions::policy::PermissionSystemConfig::default(),
+        )));
+        let (cmd_tx, cmd_rx) = crate::event::cmd_channel(32);
+        let (event_tx, mut event_rx) = crate::event::event_channel();
+        let model = deepcode_core::config::ModelProfile {
+            id: "test-model".to_string(),
+            provider: "test".to_string(),
+            display_name: None,
+            context_window: 16_384,
+            max_output_tokens: 1_024,
+            reasoning_efforts: vec![deepcode_core::config::ReasoningEffort::Off],
+        };
+        let base_tools = Arc::new(ToolRegistry::new());
+        let manager = crate::subagent::AgentTaskManager::new(
+            Arc::clone(&llm),
+            Arc::clone(&base_tools),
+            Arc::clone(&permissions),
+            Arc::new(tokio::sync::RwLock::new(
+                crate::subagent::AgentRuntimeSettings {
+                    model: model.id.clone(),
+                    reasoning_effort: Some("off".to_string()),
+                    default_subagent_model: None,
+                    default_subagent_reasoning_effort: None,
+                },
+            )),
+            vec![model],
+            event_tx.clone(),
+            2,
+        );
+        let mut tools = (*base_tools).clone();
+        tools.register(Arc::new(crate::subagent::SpawnAgentTool::new(Arc::clone(
+            &manager,
+        ))));
+        let handle = tokio::spawn(run_managed(
+            llm,
+            Arc::new(tools),
+            permissions,
+            "test-model".to_string(),
+            (1_024, 16_384),
+            Some("off".to_string()),
+            Some("parent agent".to_string()),
+            None,
+            false,
+            cmd_rx,
+            event_tx,
+            manager,
+        ));
+        cmd_tx
+            .send(AgentCommand::Process {
+                message: "delegate".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let final_message = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(AgentEvent::AgentFinished { final_message }) = event_rx.recv().await {
+                    break final_message;
+                }
+            }
+        })
+        .await
+        .expect("managed agent should finish");
+
+        assert_eq!(final_message, "final after child");
+        assert_eq!(provider.parent_calls.load(Ordering::SeqCst), 2);
+        cmd_tx.send(AgentCommand::Shutdown).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_interrupt_is_emitted_after_children_stop() {
+        let provider = Arc::new(SubagentBarrierProvider {
+            parent_calls: AtomicUsize::new(0),
+            child_finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            child_delay: std::time::Duration::from_secs(5),
+            request_builder: TestRequestBuilder,
+            response_parser: TestResponseParser,
+            compressor: TestCompressor,
+        });
+        let llm: Arc<dyn LlmProvider> = provider;
+        let permissions = Arc::new(tokio::sync::Mutex::new(PermissionSystem::new(
+            deepcode_permissions::policy::PermissionSystemConfig::default(),
+        )));
+        let (cmd_tx, cmd_rx) = crate::event::cmd_channel(32);
+        let (event_tx, mut event_rx) = crate::event::event_channel();
+        let model = deepcode_core::config::ModelProfile {
+            id: "test-model".to_string(),
+            provider: "test".to_string(),
+            display_name: None,
+            context_window: 16_384,
+            max_output_tokens: 1_024,
+            reasoning_efforts: vec![deepcode_core::config::ReasoningEffort::Off],
+        };
+        let base_tools = Arc::new(ToolRegistry::new());
+        let manager = crate::subagent::AgentTaskManager::new(
+            Arc::clone(&llm),
+            Arc::clone(&base_tools),
+            Arc::clone(&permissions),
+            Arc::new(tokio::sync::RwLock::new(
+                crate::subagent::AgentRuntimeSettings {
+                    model: model.id.clone(),
+                    reasoning_effort: Some("off".to_string()),
+                    default_subagent_model: None,
+                    default_subagent_reasoning_effort: None,
+                },
+            )),
+            vec![model],
+            event_tx.clone(),
+            2,
+        );
+        let mut tools = (*base_tools).clone();
+        tools.register(Arc::new(crate::subagent::SpawnAgentTool::new(Arc::clone(
+            &manager,
+        ))));
+        let handle = tokio::spawn(run_managed(
+            llm,
+            Arc::new(tools),
+            permissions,
+            "test-model".to_string(),
+            (1_024, 16_384),
+            Some("off".to_string()),
+            Some("parent agent".to_string()),
+            None,
+            false,
+            cmd_rx,
+            event_tx,
+            Arc::clone(&manager),
+        ));
+        cmd_tx
+            .send(AgentCommand::Process {
+                message: "delegate".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let task_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(AgentEvent::SubagentStarted { task_id, .. }) = event_rx.recv().await {
+                    break task_id;
+                }
+            }
+        })
+        .await
+        .expect("child should start");
+        cmd_tx.send(AgentCommand::Interrupt).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if matches!(event_rx.recv().await, Some(AgentEvent::Interrupted)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("parent should report interruption");
+        let results = manager.wait(&[task_id]).await.unwrap();
+        assert_eq!(results[0].status, crate::subagent::TaskStatus::Interrupted);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), async {
+                while let Some(event) = event_rx.recv().await {
+                    if matches!(
+                        event,
+                        AgentEvent::SubagentEvent { .. }
+                            | AgentEvent::SubagentCompleted { .. }
+                            | AgentEvent::SubagentStarted { .. }
+                    ) {
+                        return;
+                    }
+                }
+            })
+            .await
+            .is_err()
+        );
+
+        cmd_tx.send(AgentCommand::Shutdown).await.unwrap();
+        handle.await.unwrap().unwrap();
     }
 }

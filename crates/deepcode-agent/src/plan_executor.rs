@@ -11,7 +11,9 @@ use crate::llm_response::{
     collect_stream_response, final_text_from_blocks, response_blocks_to_content,
     tool_calls_from_blocks, StreamResponseOutcome,
 };
-use crate::r#loop::{handle_busy_command, BusyControl};
+use crate::r#loop::{
+    handle_busy_command, wait_for_uncollected_subagents, BusyControl, SubagentBarrier,
+};
 use crate::state::{AgentPhase, AgentState};
 use crate::validation::invalid_tool_input_message;
 
@@ -32,7 +34,7 @@ enum PlanResponseOutcome {
 
 pub(crate) fn planning_instruction() -> String {
     "Plan-Act mode is active. First inspect the workspace only as needed, then produce a concise Markdown plan for the requested task. \
-Do not modify files, run destructive commands, use network tools, or spawn subagents while planning. \
+Do not modify files, run destructive commands, or use network tools while planning. You may spawn read-only explorer subagents and wait for their findings, but must not spawn workers. \
 The plan must include ordered implementation steps and the checks you will run. \
 After the plan, stop and wait for user approval before acting."
         .to_string()
@@ -45,6 +47,7 @@ pub(crate) fn approved_plan_instruction(plan: &str) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_plan_review(
     llm: &Arc<dyn LlmProvider>,
     tools: &Arc<ToolRegistry>,
@@ -53,13 +56,25 @@ pub(crate) async fn execute_plan_review(
     cmd_rx: &mut CmdReceiver,
     event_tx: &EventSender,
     state: &mut AgentState,
+    task_manager: Option<Arc<crate::subagent::AgentTaskManager>>,
 ) -> PlanDecision {
     state.push_user(&planning_instruction());
     let _ = event_tx.send(AgentEvent::SessionUpdated {
         messages: state.messages.clone(),
     });
 
-    let plan = match generate_plan(llm, tools, model, model_config, cmd_rx, event_tx, state).await {
+    let plan = match generate_plan(
+        llm,
+        tools,
+        model,
+        model_config,
+        cmd_rx,
+        event_tx,
+        state,
+        task_manager,
+    )
+    .await
+    {
         PlanGeneration::Plan(plan) => plan,
         PlanGeneration::Interrupted => return PlanDecision::Interrupted,
         PlanGeneration::Shutdown => return PlanDecision::Shutdown,
@@ -88,6 +103,7 @@ enum PlanGeneration {
     Failed,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_plan(
     llm: &Arc<dyn LlmProvider>,
     tools: &Arc<ToolRegistry>,
@@ -96,6 +112,7 @@ async fn generate_plan(
     cmd_rx: &mut CmdReceiver,
     event_tx: &EventSender,
     state: &mut AgentState,
+    task_manager: Option<Arc<crate::subagent::AgentTaskManager>>,
 ) -> PlanGeneration {
     let (max_tokens, context_window) = model_config;
     let reserved_output = max_tokens.min(context_window / 4);
@@ -106,14 +123,54 @@ async fn generate_plan(
         state.turn_count = turn;
         state.phase = AgentPhase::Planning;
 
+        match wait_for_uncollected_subagents(task_manager.as_ref(), cmd_rx, event_tx, |count| {
+            format!("Waiting for {count} explorer task(s) before planning...")
+        })
+        .await
+        {
+            SubagentBarrier::Clear => {}
+            SubagentBarrier::Completed(results) => {
+                let rendered = serde_json::to_string(&results)
+                    .unwrap_or_else(|error| format!("serialization failed: {error}"));
+                state.push_user(&format!(
+                    "Explorer tasks have finished. Use these structured findings before continuing the plan.\n\n{}",
+                    rendered
+                ));
+                let _ = event_tx.send(AgentEvent::SessionUpdated {
+                    messages: state.messages.clone(),
+                });
+            }
+            SubagentBarrier::Interrupted => return PlanGeneration::Interrupted,
+            SubagentBarrier::Shutdown => return PlanGeneration::Shutdown,
+            SubagentBarrier::Failed(message) => {
+                let _ = event_tx.send(AgentEvent::AgentError { message });
+                state.phase = AgentPhase::Error;
+                return PlanGeneration::Failed;
+            }
+        }
+
         let compressor = llm.context_compressor();
         let token_estimate = compressor.estimate_tokens(&state.messages);
         if compressor.needs_compression(token_estimate, input_budget) {
             let target = (input_budget as f64 * 0.60) as usize;
-            match compressor
-                .compress(&state.messages, token_estimate, target)
-                .await
-            {
+            let messages_to_compress = state.messages.clone();
+            let compress_future =
+                compressor.compress(&messages_to_compress, token_estimate, target);
+            tokio::pin!(compress_future);
+            let compressed_result = loop {
+                tokio::select! {
+                    result = &mut compress_future => break Some(result),
+                    cmd = cmd_rx.recv() => match handle_busy_command(cmd, event_tx) {
+                        BusyControl::Continue => {}
+                        BusyControl::Interrupt => break None,
+                        BusyControl::Shutdown => return PlanGeneration::Shutdown,
+                    }
+                }
+            };
+            let Some(compressed_result) = compressed_result else {
+                return PlanGeneration::Interrupted;
+            };
+            match compressed_result {
                 Ok((messages, _)) => state.messages = messages,
                 Err(error) => {
                     let _ = event_tx.send(AgentEvent::AgentError {
@@ -247,6 +304,19 @@ async fn generate_plan(
 
         for (tool_id, tool_name, tool_input) in tool_calls {
             if let Some(tool) = tools.get(&tool_name).cloned() {
+                if tool_name == "spawn_agent"
+                    && tool_input.get("role").and_then(serde_json::Value::as_str)
+                        != Some("explorer")
+                {
+                    push_plan_tool_error(
+                        event_tx,
+                        state,
+                        &tool_id,
+                        &tool_name,
+                        "Only explorer subagents are allowed during planning.",
+                    );
+                    continue;
+                }
                 let safety = tool.safety();
                 if !safety.is_read_only || safety.requires_approval || safety.is_destructive {
                     push_plan_tool_error(
@@ -271,7 +341,22 @@ async fn generate_plan(
                     name: tool_name.clone(),
                     input: tool_input.clone(),
                 });
-                match tools.execute(&tool_name, tool_input).await {
+                let execute_future = tools.execute(&tool_name, tool_input);
+                tokio::pin!(execute_future);
+                let execute_result = loop {
+                    tokio::select! {
+                        result = &mut execute_future => break Some(result),
+                        cmd = cmd_rx.recv() => match handle_busy_command(cmd, event_tx) {
+                            BusyControl::Continue => {}
+                            BusyControl::Interrupt => break None,
+                            BusyControl::Shutdown => return PlanGeneration::Shutdown,
+                        }
+                    }
+                };
+                let Some(execute_result) = execute_result else {
+                    return PlanGeneration::Interrupted;
+                };
+                match execute_result {
                     Ok(result) => {
                         let _ = event_tx.send(AgentEvent::ToolCallCompleted {
                             id: tool_id.clone(),
@@ -309,6 +394,9 @@ async fn wait_for_plan_response(
     event_tx: &EventSender,
 ) -> PlanResponseOutcome {
     while let Some(cmd) = cmd_rx.recv().await {
+        if crate::subagent::route_nested_command(&cmd) {
+            continue;
+        }
         match cmd {
             AgentCommand::PlanResponse {
                 request_id: response_id,
@@ -321,7 +409,6 @@ async fn wait_for_plan_response(
                 };
             }
             AgentCommand::Interrupt => {
-                let _ = event_tx.send(AgentEvent::Interrupted);
                 return PlanResponseOutcome::Interrupted;
             }
             AgentCommand::Shutdown => return PlanResponseOutcome::Shutdown,
@@ -329,6 +416,7 @@ async fn wait_for_plan_response(
             | AgentCommand::PlanProcess { .. }
             | AgentCommand::SetPlanMode { .. }
             | AgentCommand::SetModel { .. }
+            | AgentCommand::SetAvailableModels { .. }
             | AgentCommand::SetReasoningEffort { .. }
             | AgentCommand::ClearSession
             | AgentCommand::PermissionsSnapshot => {

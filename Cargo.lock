@@ -627,6 +627,7 @@ dependencies = [
  "deepcode-permissions",
  "deepcode-tools",
  "futures",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

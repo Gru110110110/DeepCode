@@ -139,6 +139,11 @@ default_permissions = "project-edit"
 disabled = []
 max_file_size_bytes = 1048576
 
+[agents]
+max_concurrent = 3
+# default_model = "deepseek-v4-pro"
+# default_reasoning_effort = "high"
+
 [permissions]
 # policy_files = ["~/.config/deepcode/policies/default.star"]
 # write_policy_file = "~/.config/deepcode/policies/user.star"
@@ -184,6 +189,8 @@ justification = "Restoring files can overwrite local work."
 
 - `disabled` 会在创建工具 registry 时跳过匹配的内置工具。
 - `max_file_size_bytes` 适用于 `read_file`、`write_file` 和 `edit_file`。
+- `agents.max_concurrent` 限制同时运行的子智能体数量。explorer 可以并行，worker 为保护共享工作区而串行执行。
+- 子智能体默认继承 `/model` 和 `/effort`；可通过 agents 默认配置或单次任务参数覆盖。
 - 权限 profile 会把 filesystem、network、shell 和 tool 规则合并为 `allow`、`prompt`、`deny` 决策。
 - 交互式批准可以是单次、当前会话或持久批准。持久批准默认保存到 `~/.config/deepcode/policies/permissions.toml`。
 - `write_file` 和 `edit_file` 会先准备 unified diff 预览；如果策略已经允许该操作，则直接应用。
@@ -336,7 +343,11 @@ DEEPCODE_STATE_DIR=/tmp/deepcode-state deepcode chat
 | `git_commit` | 创建 git 提交 | 安全变更 |
 | `git_checkout` | 检出分支或恢复文件 | 破坏性 |
 | `git_branch` | 列出、创建或删除分支 | 安全变更 |
-| `agent` | 使用全新对话上下文启动子智能体 | 安全变更 |
+| `spawn_agent` | 后台启动 explorer 或 worker 并返回任务 ID | 只读编排 |
+| `wait_agents` | 等待任务并返回结构化结果、错误和用量 | 只读编排 |
+| `cancel_agents` | 取消排队中或运行中的子智能体 | 只读编排 |
+
+explorer 子智能体只拥有本地只读工具。worker 共享工作区，但同一时间只运行一个；父智能体的变更操作会等待 worker 完成，并继续使用正常的权限、沙盒和文件预览流程。打断父智能体会取消所有子智能体；一次用户任务显示的 token 用量包含父智能体及全部子智能体。
 
 文件和搜索工具限制在启动 `deepcode` 的工作空间目录内。Shell 命令从经过工作空间验证的工作目录运行，遵守配置的 shell 权限策略，60 秒后超时，并截断非常大的输出。
 

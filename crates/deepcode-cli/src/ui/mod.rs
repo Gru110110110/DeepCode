@@ -1,6 +1,7 @@
 // Terminal UI for interactive chat mode.
 // Uses an alternate-screen full-screen renderer with internal transcript scroll.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -225,6 +226,15 @@ pub(crate) struct PendingFilePreview {
 }
 
 #[derive(Clone)]
+pub(crate) enum DeferredApproval {
+    Permission(PendingPermission),
+    FilePreview {
+        tool_name: String,
+        pending: PendingFilePreview,
+    },
+}
+
+#[derive(Clone)]
 pub(crate) struct PendingPlanApproval {
     pub request_id: String,
     pub plan: String,
@@ -278,29 +288,13 @@ pub(crate) struct AppState {
     pub pending_plan: Option<PendingPlanApproval>,
     pub pending_permission: Option<PendingPermission>,
     pub pending_file_preview: Option<PendingFilePreview>,
+    pub deferred_approvals: VecDeque<DeferredApproval>,
     pub working_since: Option<Instant>,
     pub interrupt_requested: bool,
     pub last_usage: Option<TurnUsage>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TurnUsage {
-    pub input_tokens: usize,
-    pub output_tokens: usize,
-    pub cached_input_tokens: usize,
-    pub cache_miss_input_tokens: usize,
-    pub reasoning_output_tokens: usize,
-}
-
-impl TurnUsage {
-    pub(crate) fn has_reported_tokens(&self) -> bool {
-        self.input_tokens > 0
-            || self.output_tokens > 0
-            || self.cached_input_tokens > 0
-            || self.cache_miss_input_tokens > 0
-            || self.reasoning_output_tokens > 0
-    }
-}
+pub(crate) type TurnUsage = deepcode_core::provider::traits::Usage;
 
 #[derive(Clone)]
 pub(crate) struct ModelCatalogContext {
@@ -344,6 +338,7 @@ impl AppState {
             pending_plan: None,
             pending_permission: None,
             pending_file_preview: None,
+            deferred_approvals: VecDeque::new(),
             working_since: None,
             interrupt_requested: false,
             last_usage: None,
