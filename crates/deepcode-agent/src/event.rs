@@ -7,6 +7,8 @@ pub enum AgentCommand {
     Process { message: String },
     /// Start processing a user message in plan-first mode.
     PlanProcess { message: String },
+    /// Restore a persisted plan review from its plan file.
+    ResumePlan { plan_path: String },
     /// Enable or disable persistent plan-first mode.
     SetPlanMode { enabled: bool },
     /// Change the model used by subsequent turns.
@@ -27,6 +29,11 @@ pub enum AgentCommand {
     PermissionsSnapshot,
     /// Respond to a plan approval request.
     PlanResponse { request_id: String, approved: bool },
+    /// Continue discussing a proposed plan with user feedback.
+    PlanFeedback {
+        request_id: String,
+        feedback: String,
+    },
     /// Interrupt the current agent turn and return to idle.
     Interrupt,
     /// Respond to a permission request.
@@ -82,8 +89,13 @@ pub enum AgentEvent {
         input: serde_json::Value,
         preview: deepcode_tools::tool::FileChangePreview,
     },
-    /// The agent has produced a plan and needs user approval before acting.
-    PlanApprovalNeeded { request_id: String, plan: String },
+    /// The agent has persisted a plan and needs user approval before acting.
+    PlanApprovalNeeded {
+        request_id: String,
+        plan: String,
+        plan_path: String,
+        restored: bool,
+    },
     /// A turn (one LLM call + tool execution cycle) has completed.
     TurnComplete {
         input_tokens: usize,

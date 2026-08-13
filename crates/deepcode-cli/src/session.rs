@@ -11,6 +11,11 @@ pub(crate) const SESSION_SCHEMA_VERSION: u32 = 1;
 const UNTITLED: &str = "Untitled session";
 const TITLE_MAX_CHARS: usize = 60;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SavedPendingPlan {
+    pub plan_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SavedSession {
     pub schema_version: u32,
@@ -24,6 +29,10 @@ pub(crate) struct SavedSession {
     pub provider: String,
     pub model: String,
     pub reasoning_effort: String,
+    #[serde(default)]
+    pub plan_mode_enabled: bool,
+    #[serde(default)]
+    pub pending_plan: Option<SavedPendingPlan>,
     pub ui_messages: Vec<ChatMessage>,
     pub core_messages: Vec<Message>,
 }
@@ -47,6 +56,8 @@ impl SavedSession {
             provider,
             model,
             reasoning_effort,
+            plan_mode_enabled: false,
+            pending_plan: None,
             ui_messages: Vec::new(),
             core_messages: Vec::new(),
         }
@@ -223,6 +234,11 @@ fn validate_session(session: &SavedSession) -> anyhow::Result<()> {
     if uuid::Uuid::parse_str(&session.id).is_err() {
         anyhow::bail!("Session contains invalid UUID");
     }
+    if session.pending_plan.as_ref().is_some_and(|pending| {
+        pending.plan_path.trim().is_empty() || !Path::new(&pending.plan_path).is_absolute()
+    }) {
+        anyhow::bail!("Session contains invalid pending plan path");
+    }
     Ok(())
 }
 
@@ -321,6 +337,37 @@ mod tests {
         assert_eq!(store.list(Some("/one"), None).unwrap().len(), 1);
         assert_eq!(store.list(None, None).unwrap().len(), 2);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_plan_and_plan_mode_round_trip() {
+        let (store, root) = store();
+        let mut session = session("/one", "Pending plan");
+        session.plan_mode_enabled = true;
+        session.pending_plan = Some(SavedPendingPlan {
+            plan_path: "/tmp/plan-00000000-0000-0000-0000-000000000001.md".to_string(),
+        });
+
+        store.save(&mut session).unwrap();
+        let saved = store.load(&session.id).unwrap();
+
+        assert!(saved.plan_mode_enabled);
+        assert_eq!(saved.pending_plan, session.pending_plan);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_session_defaults_to_no_pending_plan() {
+        let session = session("/one", "Legacy session");
+        let mut value = serde_json::to_value(&session).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("plan_mode_enabled");
+        object.remove("pending_plan");
+
+        let restored: SavedSession = serde_json::from_value(value).unwrap();
+
+        assert!(!restored.plan_mode_enabled);
+        assert!(restored.pending_plan.is_none());
     }
 
     #[test]

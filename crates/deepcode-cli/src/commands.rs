@@ -20,6 +20,14 @@ fn dirs_home() -> PathBuf {
     deepcode_core::paths::home_dir()
 }
 
+fn plan_directory() -> anyhow::Result<PathBuf> {
+    let home = dirs_home();
+    if !home.is_absolute() {
+        anyhow::bail!("Cannot determine an absolute home directory for ~/.deepcode plan storage");
+    }
+    Ok(home.join(".deepcode").join("plans"))
+}
+
 pub(crate) fn default_config_path() -> PathBuf {
     dirs_home()
         .join(".config")
@@ -244,6 +252,7 @@ pub(crate) struct AgentContext {
     pub reasoning_effort: Option<String>,
     pub system_prompt: Option<String>,
     pub initial_messages: Option<Vec<Message>>,
+    pub plan_directory: PathBuf,
     pub cmd_tx: event::CmdSender,
     pub event_tx: event::EventSender,
     cmd_rx: event::CmdReceiver,
@@ -271,6 +280,7 @@ impl AgentContext {
                     self.reasoning_effort,
                     self.system_prompt,
                     self.initial_messages,
+                    self.plan_directory,
                     true,
                     self.cmd_rx,
                     self.event_tx,
@@ -287,6 +297,7 @@ impl AgentContext {
                     self.reasoning_effort,
                     self.system_prompt,
                     self.initial_messages,
+                    self.plan_directory,
                     true,
                     self.cmd_rx,
                     self.event_tx,
@@ -296,6 +307,24 @@ impl AgentContext {
         });
         (agent, catalog_refresh)
     }
+}
+
+async fn restore_agent_workflow(
+    cmd_tx: &event::CmdSender,
+    plan_mode_enabled: bool,
+    plan_path: Option<String>,
+) -> anyhow::Result<()> {
+    if plan_mode_enabled {
+        cmd_tx
+            .send(event::AgentCommand::SetPlanMode { enabled: true })
+            .await?;
+    }
+    if let Some(plan_path) = plan_path {
+        cmd_tx
+            .send(event::AgentCommand::ResumePlan { plan_path })
+            .await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn build_agent_context(
@@ -349,6 +378,7 @@ pub(crate) async fn build_agent_context(
     let tools = Arc::new(registry);
 
     let system_prompt = Some(build_system_prompt(&model, task_manager.is_some()));
+    let plan_directory = plan_directory()?;
 
     let context = AgentContext {
         llm,
@@ -361,6 +391,7 @@ pub(crate) async fn build_agent_context(
         reasoning_effort: Some(reasoning_effort),
         system_prompt,
         initial_messages: None,
+        plan_directory,
         cmd_tx,
         event_tx,
         cmd_rx,
@@ -1002,6 +1033,11 @@ pub(crate) async fn chat_command(
                     .unwrap_or_else(|| "off".to_string()),
             )
         });
+        let restored_plan_path = session
+            .pending_plan
+            .as_ref()
+            .map(|pending| pending.plan_path.clone());
+        let restored_plan_mode = session.plan_mode_enabled;
         let mut app_state = if session.ui_messages.is_empty() && session.core_messages.is_empty() {
             crate::ui::AppState::new()
         } else {
@@ -1010,6 +1046,7 @@ pub(crate) async fn chat_command(
                 session.core_messages.clone(),
             )
         };
+        app_state.restore_workflow(&session);
         app_state.startup_header = Some(startup_header);
         app_state.available_models = context.available_models.clone();
         let config = DeepCodeConfig::load(&config_path)?;
@@ -1032,6 +1069,7 @@ pub(crate) async fn chat_command(
             "Starting chat session"
         );
         let (agent_handle, catalog_refresh) = context.spawn_agent();
+        restore_agent_workflow(&cmd_tx, restored_plan_mode, restored_plan_path).await?;
         let tui_state = state.clone();
         let tui_cmd_tx = cmd_tx.clone();
         let tui_handle =
@@ -1069,7 +1107,7 @@ pub(crate) async fn chat_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_system_prompt, tool_enabled};
+    use super::{build_system_prompt, plan_directory, restore_agent_workflow, tool_enabled};
     use deepcode_core::config::ToolsConfig;
 
     #[test]
@@ -1087,5 +1125,32 @@ mod tests {
     fn system_prompt_only_mentions_subagents_when_enabled() {
         assert!(!build_system_prompt("test-model", false).contains("spawn_agent"));
         assert!(build_system_prompt("test-model", true).contains("spawn_agent"));
+    }
+
+    #[test]
+    fn plans_are_stored_outside_the_workspace_in_the_user_deepcode_directory() {
+        let directory = plan_directory().unwrap();
+
+        assert!(directory.is_absolute());
+        assert!(directory.ends_with(std::path::Path::new(".deepcode").join("plans")));
+    }
+
+    #[tokio::test]
+    async fn restored_workflow_enables_plan_mode_before_resuming_plan() {
+        let (cmd_tx, mut cmd_rx) = deepcode_agent::event::cmd_channel(4);
+
+        restore_agent_workflow(&cmd_tx, true, Some("/tmp/plan.md".to_string()))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            cmd_rx.recv().await,
+            Some(deepcode_agent::event::AgentCommand::SetPlanMode { enabled: true })
+        ));
+        assert!(matches!(
+            cmd_rx.recv().await,
+            Some(deepcode_agent::event::AgentCommand::ResumePlan { plan_path })
+                if plan_path == "/tmp/plan.md"
+        ));
     }
 }

@@ -56,6 +56,7 @@ pub(crate) async fn wait_for_permission_response(
             AgentCommand::Shutdown => return PermissionOutcome::Shutdown,
             AgentCommand::Process { .. }
             | AgentCommand::PlanProcess { .. }
+            | AgentCommand::ResumePlan { .. }
             | AgentCommand::SetPlanMode { .. }
             | AgentCommand::SetModel { .. }
             | AgentCommand::SetAvailableModels { .. }
@@ -68,7 +69,8 @@ pub(crate) async fn wait_for_permission_response(
             }
             AgentCommand::PermissionResponse { .. }
             | AgentCommand::FileChangePreviewResponse { .. }
-            | AgentCommand::PlanResponse { .. } => {}
+            | AgentCommand::PlanResponse { .. }
+            | AgentCommand::PlanFeedback { .. } => {}
         }
     }
 
@@ -101,6 +103,7 @@ pub(crate) async fn wait_for_file_preview_response(
             AgentCommand::Shutdown => return FilePreviewOutcome::Shutdown,
             AgentCommand::Process { .. }
             | AgentCommand::PlanProcess { .. }
+            | AgentCommand::ResumePlan { .. }
             | AgentCommand::SetPlanMode { .. }
             | AgentCommand::SetModel { .. }
             | AgentCommand::SetAvailableModels { .. }
@@ -113,7 +116,8 @@ pub(crate) async fn wait_for_file_preview_response(
             }
             AgentCommand::PermissionResponse { .. }
             | AgentCommand::FileChangePreviewResponse { .. }
-            | AgentCommand::PlanResponse { .. } => {}
+            | AgentCommand::PlanResponse { .. }
+            | AgentCommand::PlanFeedback { .. } => {}
         }
     }
 

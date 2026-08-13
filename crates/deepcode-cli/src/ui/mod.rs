@@ -6,7 +6,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::session::{SavedSession, SessionStore, SessionSummary};
+use crate::session::{SavedPendingPlan, SavedSession, SessionStore, SessionSummary};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -54,9 +54,7 @@ pub(crate) enum FilePreviewChoice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlanChoice {
     Approve,
-    Revise,
-    Reject,
-    Quit,
+    ContinueDiscussing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,14 +77,12 @@ impl PendingSessionPicker {
 }
 
 impl PlanChoice {
-    pub(crate) const ALL: [Self; 4] = [Self::Approve, Self::Revise, Self::Reject, Self::Quit];
+    pub(crate) const ALL: [Self; 2] = [Self::Approve, Self::ContinueDiscussing];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Approve => "Approve",
-            Self::Revise => "Revise",
-            Self::Reject => "Reject",
-            Self::Quit => "Quit",
+            Self::ContinueDiscussing => "Continue Discussing",
         }
     }
 
@@ -238,6 +234,7 @@ pub(crate) enum DeferredApproval {
 pub(crate) struct PendingPlanApproval {
     pub request_id: String,
     pub plan: String,
+    pub plan_path: String,
     pub selected: PlanChoice,
 }
 
@@ -286,6 +283,8 @@ pub(crate) struct AppState {
     pub pending_sessions: Option<PendingSessionPicker>,
     pub exit_action: TuiAction,
     pub pending_plan: Option<PendingPlanApproval>,
+    pub plan_feedback_request_id: Option<String>,
+    pub active_plan_path: Option<String>,
     pub pending_permission: Option<PendingPermission>,
     pub pending_file_preview: Option<PendingFilePreview>,
     pub deferred_approvals: VecDeque<DeferredApproval>,
@@ -336,6 +335,8 @@ impl AppState {
             pending_sessions: None,
             exit_action: TuiAction::Exit,
             pending_plan: None,
+            plan_feedback_request_id: None,
+            active_plan_path: None,
             pending_permission: None,
             pending_file_preview: None,
             deferred_approvals: VecDeque::new(),
@@ -358,6 +359,15 @@ impl AppState {
         let mut state = Self::with_messages(messages);
         state.core_messages = core_messages;
         state
+    }
+
+    pub(crate) fn restore_workflow(&mut self, session: &SavedSession) {
+        self.plan_mode_enabled = session.plan_mode_enabled;
+        if let Some(pending) = &session.pending_plan {
+            self.active_plan_path = Some(pending.plan_path.clone());
+            self.working_since = Some(Instant::now());
+            self.status = "Restoring plan review...".to_string();
+        }
     }
 
     pub(crate) fn scroll_up(&mut self, amount: usize) {
@@ -404,18 +414,10 @@ impl AppState {
     }
 
     pub(crate) fn persist_session(&mut self) -> anyhow::Result<()> {
+        self.sync_session_snapshot();
         let (Some(store), Some(session)) = (&self.session_store, &mut self.session) else {
             return Ok(());
         };
-        session.ui_messages = self.messages.clone();
-        session.core_messages = self.core_messages.clone();
-        if let Some(model) = &self.current_model {
-            session.model = model.clone();
-        }
-        session.reasoning_effort = self
-            .reasoning_effort
-            .clone()
-            .unwrap_or_else(|| "off".to_string());
         store.save(session)
     }
 
@@ -431,10 +433,31 @@ impl AppState {
     }
 
     pub(crate) fn save_committed_session(&mut self) -> anyhow::Result<()> {
+        self.sync_session_snapshot();
         let (Some(store), Some(session)) = (&self.session_store, &mut self.session) else {
             return Ok(());
         };
         store.save(session)
+    }
+
+    fn sync_session_snapshot(&mut self) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        session.ui_messages = self.messages.clone();
+        session.core_messages = self.core_messages.clone();
+        if let Some(model) = &self.current_model {
+            session.model = model.clone();
+        }
+        session.reasoning_effort = self
+            .reasoning_effort
+            .clone()
+            .unwrap_or_else(|| "off".to_string());
+        session.plan_mode_enabled = self.plan_mode_enabled;
+        session.pending_plan = self
+            .active_plan_path
+            .clone()
+            .map(|plan_path| SavedPendingPlan { plan_path });
     }
 }
 
@@ -563,5 +586,56 @@ mod tests {
         let state = AppState::new();
         assert!(state.status.contains("/exit"));
         assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn pending_plan_checkpoint_persists_and_restores_workflow_state() {
+        let root = std::env::temp_dir().join(format!(
+            "deepcode_pending_plan_session_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SessionStore::at(root.clone());
+        let session = SavedSession::new(
+            "/workspace".to_string(),
+            "provider".to_string(),
+            "model".to_string(),
+            "high".to_string(),
+        );
+        let session_id = session.id.clone();
+        let mut state = AppState::with_session(
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Implement recovery".to_string(),
+            }],
+            vec![deepcode_core::types::Message::user("Implement recovery")],
+        );
+        state.session_store = Some(store.clone());
+        state.session = Some(session);
+        state.plan_mode_enabled = true;
+        state.active_plan_path =
+            Some("/tmp/plan-00000000-0000-0000-0000-000000000001.md".to_string());
+
+        state.save_committed_session().unwrap();
+        let saved = store.load(&session_id).unwrap();
+        let mut restored =
+            AppState::with_session(saved.ui_messages.clone(), saved.core_messages.clone());
+        restored.restore_workflow(&saved);
+
+        assert!(saved.plan_mode_enabled);
+        assert_eq!(
+            saved
+                .pending_plan
+                .as_ref()
+                .map(|plan| plan.plan_path.as_str()),
+            Some("/tmp/plan-00000000-0000-0000-0000-000000000001.md")
+        );
+        assert!(restored.plan_mode_enabled);
+        assert_eq!(
+            restored.active_plan_path.as_deref(),
+            Some("/tmp/plan-00000000-0000-0000-0000-000000000001.md")
+        );
+        assert!(restored.working_since.is_some());
+        assert_eq!(restored.status, "Restoring plan review...");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

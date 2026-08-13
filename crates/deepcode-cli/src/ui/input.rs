@@ -98,13 +98,31 @@ pub(crate) fn handle_key(
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('a') | KeyCode::Char('A') => {
                 PlanChoice::Approve
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => PlanChoice::Revise,
-            KeyCode::Char('n') | KeyCode::Char('N') => PlanChoice::Reject,
-            KeyCode::Char('q') | KeyCode::Char('Q') => {
-                s.running = false;
-                return Ok(false);
+            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Char('r') | KeyCode::Char('R') => {
+                PlanChoice::ContinueDiscussing
             }
-            KeyCode::Esc => PlanChoice::Reject,
+            KeyCode::Esc => {
+                let plan_path = plan.plan_path.clone();
+                s.active_plan_path = None;
+                if let Err(error) = s.persist_session() {
+                    s.active_plan_path = Some(plan_path);
+                    s.pending_plan = Some(plan);
+                    s.status = format!("Could not save cancelled plan state: {error}");
+                    return Ok(true);
+                }
+                s.interrupt_requested = true;
+                s.status = "Interrupting plan...".to_string();
+                if cmd_tx
+                    .blocking_send(agent_event::AgentCommand::Interrupt)
+                    .is_err()
+                {
+                    s.active_plan_path = Some(plan.plan_path.clone());
+                    s.pending_plan = Some(plan);
+                    let _ = s.persist_session();
+                    s.status = "Agent channel closed.".to_string();
+                }
+                return Ok(true);
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 s.running = false;
                 return Ok(false);
@@ -117,42 +135,37 @@ pub(crate) fn handle_key(
 
         match choice {
             PlanChoice::Approve => {
+                let plan_path = plan.plan_path.clone();
+                s.active_plan_path = None;
+                if let Err(error) = s.persist_session() {
+                    s.active_plan_path = Some(plan_path);
+                    s.pending_plan = Some(plan);
+                    s.status = format!("Could not save approved plan state: {error}");
+                    return Ok(true);
+                }
                 let send_result = cmd_tx.blocking_send(agent_event::AgentCommand::PlanResponse {
-                    request_id: plan.request_id,
+                    request_id: plan.request_id.clone(),
                     approved: true,
                 });
-                s.status = "Executing approved plan...".to_string();
+                s.status = if s.plan_mode_enabled {
+                    "Executing approved plan; future tasks will still start in Plan mode."
+                        .to_string()
+                } else {
+                    "Executing approved plan...".to_string()
+                };
                 if send_result.is_err() {
+                    s.active_plan_path = Some(plan.plan_path.clone());
+                    s.pending_plan = Some(plan);
+                    let _ = s.persist_session();
                     s.status = "Agent channel closed.".to_string();
                 }
             }
-            PlanChoice::Reject => {
-                let send_result = cmd_tx.blocking_send(agent_event::AgentCommand::PlanResponse {
-                    request_id: plan.request_id,
-                    approved: false,
-                });
-                s.status = "Plan rejected.".to_string();
-                if send_result.is_err() {
-                    s.status = "Agent channel closed.".to_string();
-                }
-            }
-            PlanChoice::Revise => {
-                let send_result = cmd_tx.blocking_send(agent_event::AgentCommand::PlanResponse {
-                    request_id: plan.request_id,
-                    approved: false,
-                });
-                s.input = "Revise this plan: ".to_string();
-                s.cursor_pos = s.input.len();
+            PlanChoice::ContinueDiscussing => {
+                s.plan_feedback_request_id = Some(plan.request_id);
+                s.input.clear();
+                s.cursor_pos = 0;
                 s.clear_input_blocks();
-                s.working_since = None;
-                s.status = "Plan rejected. Edit the revision request and send it.".to_string();
-                if send_result.is_err() {
-                    s.status = "Agent channel closed.".to_string();
-                }
-            }
-            PlanChoice::Quit => {
-                s.running = false;
-                return Ok(false);
+                s.status = "Continue discussing the plan; enter feedback or questions.".to_string();
             }
         }
         return Ok(true);
@@ -340,6 +353,52 @@ pub(crate) fn handle_key(
             s.scroll_down(page);
         }
         KeyCode::Enter => {
+            if let Some(request_id) = s.plan_feedback_request_id.clone() {
+                let feedback = s.input.trim().to_string();
+                if feedback.is_empty() {
+                    s.status = "Enter feedback or a question about the plan.".to_string();
+                    return Ok(true);
+                }
+
+                let plan_path = s.active_plan_path.take();
+                if let Err(error) = s.persist_session() {
+                    s.active_plan_path = plan_path;
+                    s.status = format!("Could not save plan discussion state: {error}");
+                    return Ok(true);
+                }
+
+                if cmd_tx
+                    .blocking_send(agent_event::AgentCommand::PlanFeedback {
+                        request_id,
+                        feedback: feedback.clone(),
+                    })
+                    .is_err()
+                {
+                    s.active_plan_path = plan_path;
+                    let _ = s.persist_session();
+                    s.status = "Agent channel closed.".to_string();
+                } else {
+                    s.input.clear();
+                    s.cursor_pos = 0;
+                    s.clear_input_blocks();
+                    s.messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: feedback.clone(),
+                    });
+                    s.core_messages
+                        .push(deepcode_core::types::Message::user(&feedback));
+                    s.scroll_to_bottom();
+                    s.streaming_text.clear();
+                    s.interrupt_requested = false;
+                    s.plan_feedback_request_id = None;
+                    s.status = "Updating plan from feedback...".to_string();
+                    if let Err(error) = s.persist_session() {
+                        s.status = format!("Feedback sent, but session save failed: {}", error);
+                    }
+                }
+                return Ok(true);
+            }
+
             if s.working_since.is_some() && !s.input.starts_with('/') {
                 s.status = "Already working; press Esc to interrupt.".to_string();
                 return Ok(true);
@@ -792,8 +851,10 @@ mod tests {
             state.pending_plan = Some(PendingPlanApproval {
                 request_id: "plan_1".to_string(),
                 plan: "1. Inspect".to_string(),
+                plan_path: "/tmp/plan-1.md".to_string(),
                 selected: PlanChoice::Approve,
             });
+            state.active_plan_path = Some("/tmp/plan-1.md".to_string());
         }
         let (cmd_tx, mut cmd_rx) = agent_event::cmd_channel(4);
 
@@ -1244,8 +1305,10 @@ mod tests {
             state.pending_plan = Some(PendingPlanApproval {
                 request_id: "plan_1".to_string(),
                 plan: "1. Edit files\n2. Run tests".to_string(),
+                plan_path: "/tmp/plan-1.md".to_string(),
                 selected: PlanChoice::Approve,
             });
+            state.active_plan_path = Some("/tmp/plan-1.md".to_string());
         }
         let (cmd_tx, mut cmd_rx) = agent_event::cmd_channel(4);
 
@@ -1266,7 +1329,129 @@ mod tests {
             }
             other => panic!("unexpected command: {:?}", other),
         }
-        assert!(state.lock().unwrap().pending_plan.is_none());
+        let state = state.lock().unwrap();
+        assert!(state.pending_plan.is_none());
+        assert!(state.active_plan_path.is_none());
+    }
+
+    #[test]
+    fn plan_prompt_continues_discussion_and_sends_feedback() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        {
+            let mut state = state.lock().unwrap();
+            state.working_since = Some(std::time::Instant::now());
+            state.pending_plan = Some(PendingPlanApproval {
+                request_id: "plan_1".to_string(),
+                plan: "1. Edit files\n2. Run tests".to_string(),
+                plan_path: "/tmp/plan-1.md".to_string(),
+                selected: PlanChoice::ContinueDiscussing,
+            });
+            state.active_plan_path = Some("/tmp/plan-1.md".to_string());
+        }
+        let (cmd_tx, mut cmd_rx) = agent_event::cmd_channel(4);
+
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &cmd_tx,
+            &state,
+        )
+        .unwrap();
+
+        {
+            let mut state = state.lock().unwrap();
+            assert!(state.pending_plan.is_none());
+            assert_eq!(state.plan_feedback_request_id.as_deref(), Some("plan_1"));
+            assert_eq!(state.active_plan_path.as_deref(), Some("/tmp/plan-1.md"));
+            assert!(state.status.contains("Continue discussing"));
+            state.input = "Add rollback and integration-test steps".to_string();
+            state.cursor_pos = state.input.len();
+        }
+        assert!(cmd_rx.try_recv().is_err());
+
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &cmd_tx,
+            &state,
+        )
+        .unwrap();
+
+        match cmd_rx.try_recv().unwrap() {
+            agent_event::AgentCommand::PlanFeedback {
+                request_id,
+                feedback,
+            } => {
+                assert_eq!(request_id, "plan_1");
+                assert_eq!(feedback, "Add rollback and integration-test steps");
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+        let state = state.lock().unwrap();
+        assert!(state.plan_feedback_request_id.is_none());
+        assert!(state.active_plan_path.is_none());
+        assert!(state.working_since.is_some());
+        assert_eq!(state.status, "Updating plan from feedback...");
+    }
+
+    #[test]
+    fn blank_plan_feedback_keeps_the_discussion_input_open() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        {
+            let mut state = state.lock().unwrap();
+            state.working_since = Some(std::time::Instant::now());
+            state.plan_feedback_request_id = Some("plan_1".to_string());
+            state.active_plan_path = Some("/tmp/plan-1.md".to_string());
+            state.input = " \t".to_string();
+            state.cursor_pos = state.input.len();
+        }
+        let (cmd_tx, mut cmd_rx) = agent_event::cmd_channel(4);
+
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &cmd_tx,
+            &state,
+        )
+        .unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.plan_feedback_request_id.as_deref(), Some("plan_1"));
+        assert_eq!(state.input, " \t");
+        assert_eq!(state.active_plan_path.as_deref(), Some("/tmp/plan-1.md"));
+        assert!(state.status.contains("Enter feedback"));
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn escape_interrupts_plan_review_without_approving_it() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        {
+            let mut state = state.lock().unwrap();
+            state.working_since = Some(std::time::Instant::now());
+            state.pending_plan = Some(PendingPlanApproval {
+                request_id: "plan_1".to_string(),
+                plan: "1. Edit files\n2. Run tests".to_string(),
+                plan_path: "/tmp/plan-1.md".to_string(),
+                selected: PlanChoice::Approve,
+            });
+            state.active_plan_path = Some("/tmp/plan-1.md".to_string());
+        }
+        let (cmd_tx, mut cmd_rx) = agent_event::cmd_channel(4);
+
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &cmd_tx,
+            &state,
+        )
+        .unwrap();
+
+        let state = state.lock().unwrap();
+        assert!(state.pending_plan.is_none());
+        assert!(state.active_plan_path.is_none());
+        assert!(state.interrupt_requested);
+        assert!(state.status.contains("Interrupting plan"));
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(agent_event::AgentCommand::Interrupt)
+        ));
     }
 
     #[test]

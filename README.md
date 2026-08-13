@@ -315,15 +315,24 @@ permissions, file-change previews, and session checkpointing as chat mode.
 | `/quit` | Exit the session |
 
 In Plan-Act mode, DeepCode first produces a step-by-step plan, waits for
-approval, and only then executes. During planning, only read-only tools that do
-not require approval are exposed.
+approval, and only then executes. The review prompt has two choices: approve
+the plan, or continue discussing it with feedback. Discussion stays in the same
+planning turn and produces an updated plan for another review. During planning,
+only read-only tools that do not require approval are exposed. Each plan is saved
+outside the workspace as `~/.deepcode/plans/plan-<uuid>.md`, so it can be edited
+in another editor without adding files to the project. On approval, DeepCode
+reloads that file and executes its current contents. Approving a plan starts
+execution for the current task; persistent Plan-Act mode still applies to future
+tasks. If DeepCode is closed while this approval prompt is active, resuming the
+saved session restores the prompt with a fresh approval request and reloads the
+plan from disk.
 
 ### TUI Keyboard And Mouse
 
 | Shortcut | Action |
 |----------|--------|
 | `Ctrl+C` | Exit DeepCode |
-| `Esc` | Interrupt current work; reject active prompts |
+| `Esc` | Interrupt current work or cancel the active prompt |
 | `Enter` | Send input or accept the selected prompt action |
 | `Shift+Tab` | Toggle between Agent mode (direct execution) and Plan mode |
 | `Left` / `Right` / `Tab` | Change selection in permission, plan, or file preview prompts |

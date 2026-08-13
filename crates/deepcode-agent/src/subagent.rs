@@ -343,6 +343,9 @@ impl AgentTaskManager {
                 effort,
                 Some(system_prompt),
                 None,
+                deepcode_core::paths::home_dir()
+                    .join(".deepcode")
+                    .join("plans"),
                 false,
                 command_rx,
                 sub_event_tx,
@@ -722,7 +725,8 @@ pub(crate) fn route_nested_command(command: &AgentCommand) -> bool {
     let request_id = match command {
         AgentCommand::PermissionResponse { request_id, .. }
         | AgentCommand::FileChangePreviewResponse { request_id, .. }
-        | AgentCommand::PlanResponse { request_id, .. } => request_id,
+        | AgentCommand::PlanResponse { request_id, .. }
+        | AgentCommand::PlanFeedback { request_id, .. } => request_id,
         _ => return false,
     };
     let sender = approval_routes()

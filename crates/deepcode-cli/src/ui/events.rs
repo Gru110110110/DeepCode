@@ -25,6 +25,10 @@ pub(crate) fn input_status_text(state: &AppState) -> String {
     if let Some(plan) = &state.pending_plan {
         return plan_title(plan);
     }
+    if state.plan_feedback_request_id.is_some() {
+        return "Continue discussing the plan · Enter feedback or questions · Esc to cancel"
+            .to_string();
+    }
     if let Some(preview) = &state.pending_file_preview {
         return file_preview_title(preview);
     }
@@ -64,6 +68,8 @@ pub(crate) fn set_plan_mode(state: &mut AppState, cmd_tx: &agent_event::CmdSende
     {
         state.plan_mode_enabled = previous;
         state.status = "Agent channel closed; mode was not changed.".to_string();
+    } else if let Err(error) = state.persist_session() {
+        state.status = format!("Mode changed, but session save failed: {error}");
     }
 }
 
@@ -151,6 +157,7 @@ fn append_usage_summary(base: &str, usage: Option<&TurnUsage>) -> String {
 
 pub(crate) fn should_hide_empty_input_prompt(state: &AppState) -> bool {
     state.pending_plan.is_none()
+        && state.plan_feedback_request_id.is_none()
         && state.pending_permission.is_none()
         && state.pending_file_preview.is_none()
         && state.working_since.is_some()
@@ -163,7 +170,11 @@ pub(crate) fn plan_title(plan: &PendingPlanApproval) -> String {
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("Plan ready");
-    format!("Review plan: {}", truncate_chars(first_line, 104))
+    format!(
+        "Review plan: {} · Editable file: {}",
+        truncate_chars(first_line, 72),
+        plan.plan_path
+    )
 }
 
 pub(crate) fn plan_options_line(plan: &PendingPlanApproval) -> String {
@@ -524,11 +535,16 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
                 s.status = format!("Could not save session: {}", error);
             }
         }
-        AgentEvent::PlanApprovalNeeded { request_id, plan } => {
+        AgentEvent::PlanApprovalNeeded {
+            request_id,
+            plan,
+            plan_path,
+            restored,
+        } => {
             s.finish_reasoning();
             let had_streaming_plan = !s.streaming_text.is_empty();
             flush_streaming_text(&mut s);
-            if !had_streaming_plan && !plan.trim().is_empty() {
+            if !restored && !had_streaming_plan && !plan.trim().is_empty() {
                 s.messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: plan.clone(),
@@ -537,9 +553,27 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
             s.pending_plan = Some(PendingPlanApproval {
                 request_id,
                 plan,
+                plan_path: plan_path.clone(),
                 selected: PlanChoice::Approve,
             });
-            s.status = "Review plan.".to_string();
+            s.plan_feedback_request_id = None;
+            s.active_plan_path = Some(plan_path.clone());
+            let notice = format!("Editable plan file: {plan_path}");
+            if !s
+                .messages
+                .iter()
+                .any(|message| message.role == "system" && message.content == notice)
+            {
+                s.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: notice,
+                });
+            }
+            s.status = if restored {
+                "Restored plan review: approve it or continue discussing.".to_string()
+            } else {
+                "Review plan: approve it or continue discussing.".to_string()
+            };
             if let Err(error) = s.persist_session() {
                 s.status = format!("Could not save session: {}", error);
             }
@@ -572,6 +606,8 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
             s.working_since = None;
             s.interrupt_requested = false;
             s.pending_plan = None;
+            s.plan_feedback_request_id = None;
+            s.active_plan_path = None;
             s.pending_permission = None;
             s.pending_file_preview = None;
             s.deferred_approvals.clear();
@@ -586,6 +622,8 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
             s.working_since = None;
             s.interrupt_requested = false;
             s.pending_plan = None;
+            s.plan_feedback_request_id = None;
+            s.active_plan_path = None;
             s.pending_permission = None;
             s.pending_file_preview = None;
             s.deferred_approvals.clear();
@@ -600,6 +638,8 @@ pub(crate) fn handle_agent_event(event: AgentEvent, state: &Arc<Mutex<AppState>>
             s.working_since = None;
             s.interrupt_requested = false;
             s.pending_plan = None;
+            s.plan_feedback_request_id = None;
+            s.active_plan_path = None;
             s.pending_permission = None;
             s.pending_file_preview = None;
             s.deferred_approvals.clear();
@@ -1513,18 +1553,147 @@ mod tests {
             AgentEvent::PlanApprovalNeeded {
                 request_id: "plan_1".to_string(),
                 plan: "1. Inspect\n2. Edit".to_string(),
+                plan_path: "/tmp/plan-1.md".to_string(),
+                restored: false,
             },
             &state,
         );
 
         let state = state.lock().unwrap();
         let plan = state.pending_plan.as_ref().unwrap();
-        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages.len(), 2);
         assert_eq!(state.messages[0].role, "assistant");
         assert!(state.messages[0].content.contains("1. Inspect"));
+        assert_eq!(state.messages[1].role, "system");
+        assert!(state.messages[1].content.contains("/tmp/plan-1.md"));
         assert_eq!(plan.selected, PlanChoice::Approve);
+        assert_eq!(state.active_plan_path.as_deref(), Some("/tmp/plan-1.md"));
         assert!(input_status_text(&state).contains("Review plan: 1. Inspect"));
-        assert!(plan_options_line(plan).contains("[Approve]"));
+        assert!(input_status_text(&state).contains("/tmp/plan-1.md"));
+        let options = plan_options_line(plan);
+        assert!(options.contains("[Approve]"));
+        assert!(options.contains("Continue Discussing"));
+        assert!(!options.contains("Reject"));
+    }
+
+    #[test]
+    fn plan_approval_event_immediately_persists_a_resume_checkpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "deepcode_plan_approval_checkpoint_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = crate::session::SessionStore::at(root.clone());
+        let session = crate::session::SavedSession::new(
+            "/workspace".to_string(),
+            "provider".to_string(),
+            "model".to_string(),
+            "high".to_string(),
+        );
+        let session_id = session.id.clone();
+        let mut app_state = AppState::with_session(
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Implement recovery".to_string(),
+            }],
+            vec![deepcode_core::types::Message::user("Implement recovery")],
+        );
+        app_state.session_store = Some(store.clone());
+        app_state.session = Some(session);
+        let state = Arc::new(Mutex::new(app_state));
+        let plan_path = "/tmp/plan-00000000-0000-0000-0000-000000000001.md";
+
+        handle_agent_event(
+            AgentEvent::PlanApprovalNeeded {
+                request_id: "plan_1".to_string(),
+                plan: "1. Inspect\n2. Edit".to_string(),
+                plan_path: plan_path.to_string(),
+                restored: false,
+            },
+            &state,
+        );
+
+        let saved = store.load(&session_id).unwrap();
+        assert_eq!(
+            saved
+                .pending_plan
+                .as_ref()
+                .map(|pending| pending.plan_path.as_str()),
+            Some(plan_path)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restored_plan_review_reuses_history_and_creates_a_fresh_prompt() {
+        let state = Arc::new(Mutex::new(AppState::with_messages(vec![ChatMessage {
+            role: "assistant".to_string(),
+            content: "1. Inspect\n2. Edit".to_string(),
+        }])));
+
+        handle_agent_event(
+            AgentEvent::PlanApprovalNeeded {
+                request_id: "fresh_request".to_string(),
+                plan: "1. Inspect\n2. Edit".to_string(),
+                plan_path: "/tmp/plan-1.md".to_string(),
+                restored: true,
+            },
+            &state,
+        );
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| message.role == "assistant")
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .pending_plan
+                .as_ref()
+                .map(|plan| plan.request_id.as_str()),
+            Some("fresh_request")
+        );
+        assert_eq!(state.active_plan_path.as_deref(), Some("/tmp/plan-1.md"));
+        assert!(state.status.contains("Restored plan review"));
+    }
+
+    #[test]
+    fn repeated_plan_reviews_show_the_editable_path_once() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        for (request_id, plan) in [("plan_1", "1. Inspect"), ("plan_2", "1. Test")] {
+            handle_agent_event(
+                AgentEvent::PlanApprovalNeeded {
+                    request_id: request_id.to_string(),
+                    plan: plan.to_string(),
+                    plan_path: "/tmp/plan-1.md".to_string(),
+                    restored: false,
+                },
+                &state,
+            );
+        }
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.role == "system"
+                        && message.content == "Editable plan file: /tmp/plan-1.md"
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .pending_plan
+                .as_ref()
+                .map(|plan| plan.request_id.as_str()),
+            Some("plan_2")
+        );
     }
 
     #[test]

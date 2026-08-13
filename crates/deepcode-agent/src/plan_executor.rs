@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use deepcode_core::provider::traits::{
@@ -28,6 +29,7 @@ pub(crate) enum PlanDecision {
 enum PlanResponseOutcome {
     Approved,
     Denied,
+    ContinueDiscussing(String),
     Interrupted,
     Shutdown,
 }
@@ -56,12 +58,21 @@ pub(crate) async fn execute_plan_review(
     cmd_rx: &mut CmdReceiver,
     event_tx: &EventSender,
     state: &mut AgentState,
+    plan_directory: &Path,
     task_manager: Option<Arc<crate::subagent::AgentTaskManager>>,
 ) -> PlanDecision {
     state.push_user(&planning_instruction());
     let _ = event_tx.send(AgentEvent::SessionUpdated {
         messages: state.messages.clone(),
     });
+
+    let plan_path = match prepare_plan_path(plan_directory).await {
+        Ok(path) => path,
+        Err(message) => {
+            fail_plan_file(event_tx, state, message);
+            return PlanDecision::Failed;
+        }
+    };
 
     let plan = match generate_plan(
         llm,
@@ -71,7 +82,7 @@ pub(crate) async fn execute_plan_review(
         cmd_rx,
         event_tx,
         state,
-        task_manager,
+        task_manager.clone(),
     )
     .await
     {
@@ -80,20 +91,291 @@ pub(crate) async fn execute_plan_review(
         PlanGeneration::Shutdown => return PlanDecision::Shutdown,
         PlanGeneration::Failed => return PlanDecision::Failed,
     };
-
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let _ = event_tx.send(AgentEvent::PlanApprovalNeeded {
-        request_id: request_id.clone(),
-        plan: plan.clone(),
-    });
-    state.phase = AgentPhase::WaitingForPlanApproval;
-
-    match wait_for_plan_response(cmd_rx, &request_id, event_tx).await {
-        PlanResponseOutcome::Approved => PlanDecision::Approved { plan },
-        PlanResponseOutcome::Denied => PlanDecision::Rejected,
-        PlanResponseOutcome::Interrupted => PlanDecision::Interrupted,
-        PlanResponseOutcome::Shutdown => PlanDecision::Shutdown,
+    if let Err(message) = write_plan_file(&plan_path, &plan).await {
+        fail_plan_file(event_tx, state, message);
+        return PlanDecision::Failed;
     }
+
+    review_plan(
+        llm,
+        tools,
+        model,
+        model_config,
+        cmd_rx,
+        event_tx,
+        state,
+        plan_path,
+        plan,
+        false,
+        task_manager,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resume_plan_review(
+    llm: &Arc<dyn LlmProvider>,
+    tools: &Arc<ToolRegistry>,
+    model: &str,
+    model_config: (usize, usize),
+    cmd_rx: &mut CmdReceiver,
+    event_tx: &EventSender,
+    state: &mut AgentState,
+    plan_directory: &Path,
+    saved_plan_path: &str,
+    task_manager: Option<Arc<crate::subagent::AgentTaskManager>>,
+) -> PlanDecision {
+    let plan_path =
+        match resolve_resumed_plan_path(plan_directory, Path::new(saved_plan_path)).await {
+            Ok(path) => path,
+            Err(message) => {
+                fail_plan_file(event_tx, state, message);
+                return PlanDecision::Failed;
+            }
+        };
+    let plan = match read_plan_file(&plan_path).await {
+        Ok(plan) => plan,
+        Err(message) => {
+            fail_plan_file(event_tx, state, message);
+            return PlanDecision::Failed;
+        }
+    };
+    let _ = event_tx.send(AgentEvent::StatusUpdate {
+        message: format!("Restoring plan review from {}.", plan_path.display()),
+    });
+
+    review_plan(
+        llm,
+        tools,
+        model,
+        model_config,
+        cmd_rx,
+        event_tx,
+        state,
+        plan_path,
+        plan,
+        true,
+        task_manager,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn review_plan(
+    llm: &Arc<dyn LlmProvider>,
+    tools: &Arc<ToolRegistry>,
+    model: &str,
+    model_config: (usize, usize),
+    cmd_rx: &mut CmdReceiver,
+    event_tx: &EventSender,
+    state: &mut AgentState,
+    plan_path: PathBuf,
+    mut plan: String,
+    mut restored: bool,
+    task_manager: Option<Arc<crate::subagent::AgentTaskManager>>,
+) -> PlanDecision {
+    loop {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let _ = event_tx.send(AgentEvent::PlanApprovalNeeded {
+            request_id: request_id.clone(),
+            plan: plan.clone(),
+            plan_path: plan_path.display().to_string(),
+            restored,
+        });
+        state.phase = AgentPhase::WaitingForPlanApproval;
+
+        match wait_for_plan_response(cmd_rx, &request_id, event_tx).await {
+            PlanResponseOutcome::Approved => {
+                let final_plan = match read_plan_file(&plan_path).await {
+                    Ok(plan) => plan,
+                    Err(message) => {
+                        fail_plan_file(event_tx, state, message);
+                        return PlanDecision::Failed;
+                    }
+                };
+                if final_plan != plan {
+                    let _ = event_tx.send(AgentEvent::StatusUpdate {
+                        message: format!(
+                            "Using externally edited plan from {}.",
+                            plan_path.display()
+                        ),
+                    });
+                }
+                return PlanDecision::Approved { plan: final_plan };
+            }
+            PlanResponseOutcome::Denied => return PlanDecision::Rejected,
+            PlanResponseOutcome::ContinueDiscussing(feedback) => {
+                let current_plan = match read_plan_file(&plan_path).await {
+                    Ok(plan) => plan,
+                    Err(message) => {
+                        fail_plan_file(event_tx, state, message);
+                        return PlanDecision::Failed;
+                    }
+                };
+                state.push_user(&format!(
+                    "Continue discussing the proposed plan. Address the user's feedback or questions, then produce a complete updated plan for approval. Do not execute the plan yet. The current plan below was reloaded from disk and may contain edits made outside DeepCode.\n\nCurrent plan file: {}\n\nCurrent plan:\n{}\n\nUser feedback:\n{}",
+                    plan_path.display(), current_plan, feedback
+                ));
+                let _ = event_tx.send(AgentEvent::SessionUpdated {
+                    messages: state.messages.clone(),
+                });
+                let _ = event_tx.send(AgentEvent::StatusUpdate {
+                    message: "Updating plan from feedback...".to_string(),
+                });
+                plan = match generate_plan(
+                    llm,
+                    tools,
+                    model,
+                    model_config,
+                    cmd_rx,
+                    event_tx,
+                    state,
+                    task_manager.clone(),
+                )
+                .await
+                {
+                    PlanGeneration::Plan(plan) => plan,
+                    PlanGeneration::Interrupted => return PlanDecision::Interrupted,
+                    PlanGeneration::Shutdown => return PlanDecision::Shutdown,
+                    PlanGeneration::Failed => return PlanDecision::Failed,
+                };
+                if let Err(message) = write_plan_file(&plan_path, &plan).await {
+                    fail_plan_file(event_tx, state, message);
+                    return PlanDecision::Failed;
+                }
+                restored = false;
+            }
+            PlanResponseOutcome::Interrupted => return PlanDecision::Interrupted,
+            PlanResponseOutcome::Shutdown => return PlanDecision::Shutdown,
+        }
+    }
+}
+
+async fn resolve_resumed_plan_path(
+    plan_directory: &Path,
+    saved_plan_path: &Path,
+) -> Result<PathBuf, String> {
+    if !saved_plan_path.is_absolute() {
+        return Err(format!(
+            "Persisted plan path {} is not absolute.",
+            saved_plan_path.display()
+        ));
+    }
+    reject_symlink(plan_directory).await?;
+    reject_symlink(saved_plan_path).await?;
+    let canonical_plan_dir = tokio::fs::canonicalize(plan_directory)
+        .await
+        .map_err(|error| format!("Cannot resolve {}: {error}", plan_directory.display()))?;
+    let canonical_plan_path = tokio::fs::canonicalize(saved_plan_path)
+        .await
+        .map_err(|error| format!("Cannot resolve {}: {error}", saved_plan_path.display()))?;
+    if canonical_plan_path.parent() != Some(canonical_plan_dir.as_path())
+        || !is_managed_plan_filename(&canonical_plan_path)
+    {
+        return Err(format!(
+            "Persisted plan file {} is outside the managed plan directory.",
+            saved_plan_path.display()
+        ));
+    }
+    Ok(canonical_plan_path)
+}
+
+fn is_managed_plan_filename(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("plan-"))
+        .and_then(|name| name.strip_suffix(".md"))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+async fn prepare_plan_path(plan_directory: &Path) -> Result<PathBuf, String> {
+    let parent = plan_directory.parent().ok_or_else(|| {
+        format!(
+            "Plan directory {} has no parent directory.",
+            plan_directory.display()
+        )
+    })?;
+    reject_symlink(parent).await?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
+    reject_symlink(plan_directory).await?;
+    tokio::fs::create_dir_all(plan_directory)
+        .await
+        .map_err(|error| format!("Cannot create {}: {error}", plan_directory.display()))?;
+    restrict_plan_directory_permissions(plan_directory).await?;
+    let canonical_plan_dir = tokio::fs::canonicalize(plan_directory)
+        .await
+        .map_err(|error| format!("Cannot resolve {}: {error}", plan_directory.display()))?;
+
+    Ok(canonical_plan_dir.join(format!("plan-{}.md", uuid::Uuid::new_v4())))
+}
+
+async fn reject_symlink(path: &Path) -> Result<(), String> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "Refusing to use symlinked plan storage path {}.",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Cannot inspect {}: {error}", path.display())),
+    }
+}
+
+async fn write_plan_file(path: &Path, plan: &str) -> Result<(), String> {
+    reject_symlink(path).await?;
+    tokio::fs::write(path, plan)
+        .await
+        .map_err(|error| format!("Cannot save plan to {}: {error}", path.display()))?;
+    restrict_plan_file_permissions(path).await
+}
+
+#[cfg(unix)]
+async fn restrict_plan_directory_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|error| format!("Cannot secure plan directory {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+async fn restrict_plan_directory_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn restrict_plan_file_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|error| format!("Cannot secure plan file {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+async fn restrict_plan_file_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+async fn read_plan_file(path: &Path) -> Result<String, String> {
+    reject_symlink(path).await?;
+    let plan = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| format!("Cannot read plan from {}: {error}", path.display()))?;
+    if plan.trim().is_empty() {
+        return Err(format!(
+            "Plan file {} is empty; add a plan before approving or continuing.",
+            path.display()
+        ));
+    }
+    Ok(plan)
+}
+
+fn fail_plan_file(event_tx: &EventSender, state: &mut AgentState, message: String) {
+    let _ = event_tx.send(AgentEvent::AgentError { message });
+    state.phase = AgentPhase::Error;
 }
 
 enum PlanGeneration {
@@ -408,12 +690,19 @@ async fn wait_for_plan_response(
                     PlanResponseOutcome::Denied
                 };
             }
+            AgentCommand::PlanFeedback {
+                request_id: response_id,
+                feedback,
+            } if response_id == request_id && !feedback.trim().is_empty() => {
+                return PlanResponseOutcome::ContinueDiscussing(feedback);
+            }
             AgentCommand::Interrupt => {
                 return PlanResponseOutcome::Interrupted;
             }
             AgentCommand::Shutdown => return PlanResponseOutcome::Shutdown,
             AgentCommand::Process { .. }
             | AgentCommand::PlanProcess { .. }
+            | AgentCommand::ResumePlan { .. }
             | AgentCommand::SetPlanMode { .. }
             | AgentCommand::SetModel { .. }
             | AgentCommand::SetAvailableModels { .. }
@@ -426,7 +715,8 @@ async fn wait_for_plan_response(
             }
             AgentCommand::PermissionResponse { .. }
             | AgentCommand::FileChangePreviewResponse { .. }
-            | AgentCommand::PlanResponse { .. } => {}
+            | AgentCommand::PlanResponse { .. }
+            | AgentCommand::PlanFeedback { .. } => {}
         }
     }
 
@@ -449,4 +739,143 @@ fn push_plan_tool_error(
     let _ = event_tx.send(AgentEvent::SessionUpdated {
         messages: state.messages.clone(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_root() -> PathBuf {
+        std::env::temp_dir().join(format!("deepcode-plan-file-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn cleanup(root: &Path) {
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn read_plan_file_rejects_missing_and_blank_files() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let plan_path = root.join("plan.md");
+
+        let missing = read_plan_file(&plan_path).await.unwrap_err();
+        assert!(missing.contains("Cannot read plan"));
+
+        tokio::fs::write(&plan_path, " \n\t").await.unwrap();
+        let blank = read_plan_file(&plan_path).await.unwrap_err();
+        assert!(blank.contains("is empty"));
+
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn prepared_plan_path_uses_the_canonical_plan_directory() {
+        let root = test_root();
+        let plan_directory = root.join("plans");
+
+        let plan_path = prepare_plan_path(&plan_directory).await.unwrap();
+
+        assert_eq!(
+            plan_path.parent().unwrap(),
+            plan_directory.canonicalize().unwrap()
+        );
+        assert_eq!(
+            plan_path.extension().and_then(|value| value.to_str()),
+            Some("md")
+        );
+        assert!(plan_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.starts_with("plan-")));
+        assert!(!plan_path.exists());
+
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plan_storage_is_private_to_the_current_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root();
+        let plan_directory = root.join("plans");
+        let plan_path = prepare_plan_path(&plan_directory).await.unwrap();
+        write_plan_file(&plan_path, "# Private plan\n")
+            .await
+            .unwrap();
+
+        let directory_mode = std::fs::metadata(&plan_directory)
+            .unwrap()
+            .permissions()
+            .mode();
+        let file_mode = std::fs::metadata(&plan_path).unwrap().permissions().mode();
+        assert_eq!(directory_mode & 0o777, 0o700);
+        assert_eq!(file_mode & 0o777, 0o600);
+
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn resumed_plan_path_must_be_a_managed_plan_file() {
+        let root = test_root();
+        let plan_directory = root.join("plans");
+        tokio::fs::create_dir_all(&plan_directory).await.unwrap();
+        let outside_path = root.join(format!("plan-{}.md", uuid::Uuid::new_v4()));
+        tokio::fs::write(&outside_path, "# Outside\n")
+            .await
+            .unwrap();
+        let invalid_name = plan_directory.join("custom-plan.md");
+        tokio::fs::write(&invalid_name, "# Invalid name\n")
+            .await
+            .unwrap();
+
+        let outside = resolve_resumed_plan_path(&plan_directory, &outside_path)
+            .await
+            .unwrap_err();
+        let invalid = resolve_resumed_plan_path(&plan_directory, &invalid_name)
+            .await
+            .unwrap_err();
+
+        assert!(outside.contains("outside the managed plan directory"));
+        assert!(invalid.contains("outside the managed plan directory"));
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_plan_path_rejects_symlinked_plan_directory() {
+        let root = test_root();
+        let target = root.join("target");
+        let plan_directory = root.join("plans");
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        std::os::unix::fs::symlink(&target, &plan_directory).unwrap();
+
+        let error = prepare_plan_path(&plan_directory).await.unwrap_err();
+
+        assert!(error.contains("symlinked plan storage path"));
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_plan_file_does_not_follow_a_symlink() {
+        let root = test_root();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let target = root.join("target.md");
+        let plan_path = root.join("plan.md");
+        tokio::fs::write(&target, "unchanged").await.unwrap();
+        std::os::unix::fs::symlink(&target, &plan_path).unwrap();
+
+        let error = write_plan_file(&plan_path, "replacement")
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("symlinked plan storage path"));
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "unchanged"
+        );
+        cleanup(&root);
+    }
 }

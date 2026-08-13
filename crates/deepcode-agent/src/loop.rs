@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use deepcode_core::error::DeepCodeError;
@@ -6,7 +7,9 @@ use deepcode_permissions::pipeline::PermissionSystem;
 use deepcode_tools::registry::ToolRegistry;
 
 use crate::event::{AgentCommand, AgentEvent, EventSender};
-use crate::plan_executor::{approved_plan_instruction, execute_plan_review, PlanDecision};
+use crate::plan_executor::{
+    approved_plan_instruction, execute_plan_review, resume_plan_review, PlanDecision,
+};
 use crate::state::{AgentPhase, AgentState};
 use crate::turn_executor::execute_turn;
 
@@ -74,6 +77,7 @@ pub(crate) fn handle_busy_command(
         Some(AgentCommand::Shutdown) | None => BusyControl::Shutdown,
         Some(AgentCommand::Process { .. })
         | Some(AgentCommand::PlanProcess { .. })
+        | Some(AgentCommand::ResumePlan { .. })
         | Some(AgentCommand::SetPlanMode { .. })
         | Some(AgentCommand::SetModel { .. })
         | Some(AgentCommand::SetAvailableModels { .. })
@@ -87,7 +91,8 @@ pub(crate) fn handle_busy_command(
         }
         Some(AgentCommand::PermissionResponse { .. })
         | Some(AgentCommand::FileChangePreviewResponse { .. })
-        | Some(AgentCommand::PlanResponse { .. }) => BusyControl::Continue,
+        | Some(AgentCommand::PlanResponse { .. })
+        | Some(AgentCommand::PlanFeedback { .. }) => BusyControl::Continue,
     }
 }
 
@@ -103,6 +108,7 @@ async fn process_user_message(
     state: &mut AgentState,
     message: String,
     plan_first: bool,
+    plan_directory: &std::path::Path,
     task_manager: Option<&Arc<crate::subagent::AgentTaskManager>>,
 ) -> bool {
     if let Some(manager) = task_manager {
@@ -120,7 +126,7 @@ async fn process_user_message(
     });
 
     if plan_first {
-        match execute_plan_review(
+        let decision = execute_plan_review(
             llm,
             tools,
             model,
@@ -128,61 +134,157 @@ async fn process_user_message(
             cmd_rx,
             event_tx,
             state,
+            plan_directory,
             task_manager.cloned(),
         )
-        .await
-        {
-            PlanDecision::Approved { plan } => {
-                state.push_user(&approved_plan_instruction(&plan));
-                let _ = event_tx.send(AgentEvent::SessionUpdated {
-                    messages: state.messages.clone(),
-                });
-            }
-            PlanDecision::Rejected => {
-                tracing::info!("Plan rejected by user");
-                if let Some(manager) = task_manager {
-                    manager.cancel_all().await;
-                }
-                state.phase = AgentPhase::Idle;
-                let message = "Plan rejected.".to_string();
-                let _ = event_tx.send(AgentEvent::StatusUpdate {
-                    message: message.clone(),
-                });
-                let _ = event_tx.send(AgentEvent::AgentFinished {
-                    final_message: message,
-                });
-                return false;
-            }
-            PlanDecision::Interrupted => {
-                tracing::info!("Agent plan interrupted");
-                if let Some(manager) = task_manager {
-                    manager.interrupt_all().await;
-                }
-                let _ = event_tx.send(AgentEvent::Interrupted);
-                state.phase = AgentPhase::Idle;
-                return false;
-            }
-            PlanDecision::Shutdown => {
-                tracing::info!("Agent plan shutdown requested");
-                if let Some(manager) = task_manager {
-                    manager.cancel_all().await;
-                }
-                state.phase = AgentPhase::Finished;
-                return true;
-            }
-            PlanDecision::Failed => {
-                tracing::info!("Agent plan failed");
-                if let Some(manager) = task_manager {
-                    manager.cancel_all().await;
-                }
-                if state.phase != AgentPhase::Error {
-                    state.phase = AgentPhase::Idle;
-                }
-                return false;
-            }
+        .await;
+        if let Err(exit) = handle_plan_decision(decision, event_tx, state, task_manager).await {
+            return exit;
         }
     }
 
+    execute_current_turn(
+        llm,
+        tools,
+        permissions,
+        model,
+        model_config,
+        cmd_rx,
+        event_tx,
+        state,
+        task_manager,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_resumed_plan(
+    llm: &Arc<dyn LlmProvider>,
+    tools: &Arc<ToolRegistry>,
+    permissions: &Arc<tokio::sync::Mutex<PermissionSystem>>,
+    model: &str,
+    model_config: (usize, usize),
+    cmd_rx: &mut crate::event::CmdReceiver,
+    event_tx: &EventSender,
+    state: &mut AgentState,
+    plan_directory: &std::path::Path,
+    plan_path: &str,
+    task_manager: Option<&Arc<crate::subagent::AgentTaskManager>>,
+) -> bool {
+    if let Some(manager) = task_manager {
+        manager.reset_for_parent_turn().await;
+    }
+    tracing::info!(plan_path, "Restoring persisted plan review");
+    let decision = resume_plan_review(
+        llm,
+        tools,
+        model,
+        model_config,
+        cmd_rx,
+        event_tx,
+        state,
+        plan_directory,
+        plan_path,
+        task_manager.cloned(),
+    )
+    .await;
+    if let Err(exit) = handle_plan_decision(decision, event_tx, state, task_manager).await {
+        return exit;
+    }
+
+    execute_current_turn(
+        llm,
+        tools,
+        permissions,
+        model,
+        model_config,
+        cmd_rx,
+        event_tx,
+        state,
+        task_manager,
+    )
+    .await
+}
+
+async fn handle_plan_decision(
+    decision: PlanDecision,
+    event_tx: &EventSender,
+    state: &mut AgentState,
+    task_manager: Option<&Arc<crate::subagent::AgentTaskManager>>,
+) -> Result<(), bool> {
+    match decision {
+        PlanDecision::Approved { plan } => {
+            let message = if state.plan_mode_enabled {
+                "Executing approved plan. Plan mode remains enabled for future tasks."
+            } else {
+                "Executing approved plan."
+            };
+            let _ = event_tx.send(AgentEvent::StatusUpdate {
+                message: message.to_string(),
+            });
+            state.push_user(&approved_plan_instruction(&plan));
+            let _ = event_tx.send(AgentEvent::SessionUpdated {
+                messages: state.messages.clone(),
+            });
+            Ok(())
+        }
+        PlanDecision::Rejected => {
+            tracing::info!("Plan rejected by user");
+            if let Some(manager) = task_manager {
+                manager.cancel_all().await;
+            }
+            state.phase = AgentPhase::Idle;
+            let message = "Plan rejected.".to_string();
+            let _ = event_tx.send(AgentEvent::StatusUpdate {
+                message: message.clone(),
+            });
+            let _ = event_tx.send(AgentEvent::AgentFinished {
+                final_message: message,
+            });
+            Err(false)
+        }
+        PlanDecision::Interrupted => {
+            tracing::info!("Agent plan interrupted");
+            if let Some(manager) = task_manager {
+                manager.interrupt_all().await;
+            }
+            let _ = event_tx.send(AgentEvent::Interrupted);
+            state.phase = AgentPhase::Idle;
+            Err(false)
+        }
+        PlanDecision::Shutdown => {
+            tracing::info!("Agent plan shutdown requested");
+            if let Some(manager) = task_manager {
+                manager.cancel_all().await;
+            }
+            state.phase = AgentPhase::Finished;
+            Err(true)
+        }
+        PlanDecision::Failed => {
+            tracing::info!("Agent plan failed");
+            if let Some(manager) = task_manager {
+                manager.cancel_all().await;
+            }
+            if state.phase != AgentPhase::Error {
+                state.phase = AgentPhase::Idle;
+            }
+            Err(false)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_current_turn(
+    llm: &Arc<dyn LlmProvider>,
+    tools: &Arc<ToolRegistry>,
+    permissions: &Arc<tokio::sync::Mutex<PermissionSystem>>,
+    model: &str,
+    model_config: (usize, usize),
+    cmd_rx: &mut crate::event::CmdReceiver,
+    event_tx: &EventSender,
+    state: &mut AgentState,
+    task_manager: Option<&Arc<crate::subagent::AgentTaskManager>>,
+) -> bool {
     let result = execute_turn(
         llm,
         tools,
@@ -234,6 +336,7 @@ pub async fn run(
     reasoning_effort: Option<String>,
     system_prompt: Option<String>,
     initial_messages: Option<Vec<deepcode_core::types::Message>>,
+    plan_directory: PathBuf,
     session_title_enabled: bool,
     cmd_rx: crate::event::CmdReceiver,
     event_tx: EventSender,
@@ -247,6 +350,7 @@ pub async fn run(
         reasoning_effort,
         system_prompt,
         initial_messages,
+        plan_directory,
         session_title_enabled,
         cmd_rx,
         event_tx,
@@ -265,6 +369,7 @@ pub async fn run_managed(
     reasoning_effort: Option<String>,
     system_prompt: Option<String>,
     initial_messages: Option<Vec<deepcode_core::types::Message>>,
+    plan_directory: PathBuf,
     session_title_enabled: bool,
     cmd_rx: crate::event::CmdReceiver,
     event_tx: EventSender,
@@ -279,6 +384,7 @@ pub async fn run_managed(
         reasoning_effort,
         system_prompt,
         initial_messages,
+        plan_directory,
         session_title_enabled,
         cmd_rx,
         event_tx,
@@ -297,6 +403,7 @@ async fn run_internal(
     reasoning_effort: Option<String>,
     system_prompt: Option<String>,
     initial_messages: Option<Vec<deepcode_core::types::Message>>,
+    plan_directory: PathBuf,
     session_title_enabled: bool,
     cmd_rx: crate::event::CmdReceiver,
     event_tx: EventSender,
@@ -357,6 +464,16 @@ async fn run_internal(
                 let command = AgentCommand::PlanResponse {
                     request_id,
                     approved,
+                };
+                let _ = crate::subagent::route_nested_command(&command);
+            }
+            AgentCommand::PlanFeedback {
+                request_id,
+                feedback,
+            } => {
+                let command = AgentCommand::PlanFeedback {
+                    request_id,
+                    feedback,
                 };
                 let _ = crate::subagent::route_nested_command(&command);
             }
@@ -425,6 +542,25 @@ async fn run_internal(
                 let lines = permissions.lock().await.snapshot_lines();
                 let _ = event_tx.send(AgentEvent::PermissionsSnapshot { lines });
             }
+            AgentCommand::ResumePlan { plan_path } => {
+                if process_resumed_plan(
+                    &llm,
+                    &tools,
+                    &permissions,
+                    &model,
+                    model_config,
+                    &mut cmd_rx,
+                    &event_tx,
+                    &mut state,
+                    &plan_directory,
+                    &plan_path,
+                    task_manager.as_ref(),
+                )
+                .await
+                {
+                    break;
+                }
+            }
             AgentCommand::PlanProcess { message } => {
                 if process_user_message(
                     &llm,
@@ -437,6 +573,7 @@ async fn run_internal(
                     &mut state,
                     message,
                     true,
+                    &plan_directory,
                     task_manager.as_ref(),
                 )
                 .await
@@ -457,6 +594,7 @@ async fn run_internal(
                     &mut state,
                     message,
                     plan_first,
+                    &plan_directory,
                     task_manager.as_ref(),
                 )
                 .await
@@ -490,6 +628,18 @@ mod tests {
     use futures::stream::{self, Stream};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_plan_directory() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("deepcode-plan-test-{}", uuid::Uuid::new_v4()))
+            .join("plans")
+    }
+
+    fn cleanup_test_plan_directory(plan_directory: &std::path::Path) {
+        if let Some(root) = plan_directory.parent() {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 
     struct TestRequestBuilder;
 
@@ -1213,6 +1363,7 @@ mod tests {
             None,
             None,
             None,
+            test_plan_directory(),
             false,
             cmd_rx,
             event_tx,
@@ -1298,6 +1449,7 @@ mod tests {
             None,
             None,
             None,
+            test_plan_directory(),
             false,
             cmd_rx,
             event_tx,
@@ -1363,6 +1515,7 @@ mod tests {
             None,
             None,
             None,
+            test_plan_directory(),
             false,
             cmd_rx,
             event_tx,
@@ -1427,6 +1580,7 @@ mod tests {
             None,
             None,
             None,
+            test_plan_directory(),
             false,
             cmd_rx,
             event_tx,
@@ -1479,6 +1633,7 @@ mod tests {
         )));
         let (cmd_tx, cmd_rx) = crate::event::cmd_channel(8);
         let (event_tx, mut event_rx) = crate::event::event_channel();
+        let plan_directory = test_plan_directory();
 
         let handle = tokio::spawn(run(
             llm,
@@ -1489,6 +1644,7 @@ mod tests {
             None,
             None,
             None,
+            plan_directory.clone(),
             false,
             cmd_rx,
             event_tx,
@@ -1516,7 +1672,17 @@ mod tests {
 
         let mut events = Vec::new();
         while let Some(event) = event_rx.recv().await {
-            if let AgentEvent::PlanApprovalNeeded { request_id, .. } = &event {
+            if let AgentEvent::PlanApprovalNeeded {
+                request_id,
+                plan,
+                plan_path,
+                ..
+            } = &event
+            {
+                assert_eq!(
+                    std::fs::read_to_string(plan_path).unwrap().trim(),
+                    plan.trim()
+                );
                 cmd_tx
                     .send(AgentCommand::PlanResponse {
                         request_id: request_id.clone(),
@@ -1541,6 +1707,7 @@ mod tests {
             .as_ref()
             .map(|count| count.load(Ordering::SeqCst))
             .unwrap_or(0);
+        cleanup_test_plan_directory(&plan_directory);
         (events, executions)
     }
 
@@ -1556,6 +1723,103 @@ mod tests {
         )
         .await;
         events
+    }
+
+    #[derive(Clone, Copy)]
+    enum InvalidPlanFile {
+        Missing,
+        Empty,
+        #[cfg(unix)]
+        Symlink,
+    }
+
+    async fn run_agent_with_invalid_plan_file(mutation: InvalidPlanFile) -> Vec<AgentEvent> {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let tools = Arc::new(registry);
+        let permissions = Arc::new(tokio::sync::Mutex::new(PermissionSystem::new(
+            deepcode_permissions::policy::PermissionSystemConfig::default(),
+        )));
+        let (cmd_tx, cmd_rx) = crate::event::cmd_channel(8);
+        let (event_tx, mut event_rx) = crate::event::event_channel();
+        let plan_directory = test_plan_directory();
+
+        let handle = tokio::spawn(run(
+            Arc::new(ToolLoopProvider::new()),
+            tools,
+            permissions,
+            "test-model".to_string(),
+            (128, 4096),
+            None,
+            None,
+            None,
+            plan_directory.clone(),
+            false,
+            cmd_rx,
+            event_tx,
+        ));
+        cmd_tx
+            .send(AgentCommand::PlanProcess {
+                message: "go".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            if let AgentEvent::PlanApprovalNeeded {
+                request_id,
+                plan_path,
+                ..
+            } = &event
+            {
+                match mutation {
+                    InvalidPlanFile::Missing => tokio::fs::remove_file(plan_path).await.unwrap(),
+                    InvalidPlanFile::Empty => tokio::fs::write(plan_path, " \n").await.unwrap(),
+                    #[cfg(unix)]
+                    InvalidPlanFile::Symlink => {
+                        let target = plan_directory.parent().unwrap().join("replacement-plan.md");
+                        tokio::fs::write(&target, "# Replacement plan\n")
+                            .await
+                            .unwrap();
+                        tokio::fs::remove_file(plan_path).await.unwrap();
+                        std::os::unix::fs::symlink(target, plan_path).unwrap();
+                    }
+                }
+                cmd_tx
+                    .send(AgentCommand::PlanResponse {
+                        request_id: request_id.clone(),
+                        approved: true,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let done = matches!(&event, AgentEvent::AgentError { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        cleanup_test_plan_directory(&plan_directory);
+        events
+    }
+
+    fn session_contains_approved_plan(events: &[AgentEvent]) -> bool {
+        events.iter().any(|event| match event {
+            AgentEvent::SessionUpdated { messages } => messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text { text }
+                            if text.contains("The user approved this plan")
+                    )
+                })
+            }),
+            _ => false,
+        })
     }
 
     #[tokio::test]
@@ -1995,6 +2259,286 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resumed_plan_review_reloads_and_executes_the_latest_disk_plan() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let tools = Arc::new(registry);
+        let permissions = Arc::new(tokio::sync::Mutex::new(PermissionSystem::new(
+            deepcode_permissions::policy::PermissionSystemConfig::default(),
+        )));
+        let (cmd_tx, cmd_rx) = crate::event::cmd_channel(8);
+        let (event_tx, mut event_rx) = crate::event::event_channel();
+        let plan_directory = test_plan_directory();
+        tokio::fs::create_dir_all(&plan_directory).await.unwrap();
+        let plan_path = plan_directory.join(format!("plan-{}.md", uuid::Uuid::new_v4()));
+        tokio::fs::write(&plan_path, "# Persisted plan\n\n1. Inspect\n")
+            .await
+            .unwrap();
+
+        let handle = tokio::spawn(run(
+            Arc::new(ToolLoopProvider::new()),
+            tools,
+            permissions,
+            "test-model".to_string(),
+            (128, 4096),
+            None,
+            None,
+            Some(vec![Message::user("original task")]),
+            plan_directory.clone(),
+            false,
+            cmd_rx,
+            event_tx,
+        ));
+        cmd_tx
+            .send(AgentCommand::ResumePlan {
+                plan_path: plan_path.display().to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut restored_prompt_seen = false;
+        let mut latest_plan_executed = false;
+        let mut finished = false;
+        while let Some(event) = event_rx.recv().await {
+            match &event {
+                AgentEvent::PlanApprovalNeeded {
+                    request_id,
+                    plan,
+                    plan_path: event_path,
+                    restored,
+                } => {
+                    assert!(*restored);
+                    assert_eq!(plan, "# Persisted plan\n\n1. Inspect\n");
+                    assert_eq!(
+                        std::path::Path::new(event_path),
+                        plan_path.canonicalize().unwrap()
+                    );
+                    restored_prompt_seen = true;
+                    tokio::fs::write(
+                        &plan_path,
+                        "# Edited after restart\n\n1. Execute the latest file\n",
+                    )
+                    .await
+                    .unwrap();
+                    cmd_tx
+                        .send(AgentCommand::PlanResponse {
+                            request_id: request_id.clone(),
+                            approved: true,
+                        })
+                        .await
+                        .unwrap();
+                }
+                AgentEvent::SessionUpdated { messages } => {
+                    latest_plan_executed |= messages.iter().any(|message| {
+                        message.role == Role::User
+                            && message.content.iter().any(|block| {
+                                matches!(
+                                    block,
+                                    ContentBlock::Text { text }
+                                        if text.contains("The user approved this plan")
+                                            && text.contains("# Edited after restart")
+                                            && text.contains("Execute the latest file")
+                                )
+                            })
+                    });
+                }
+                AgentEvent::AgentFinished { final_message } => {
+                    assert_eq!(final_message, "done");
+                    finished = true;
+                    break;
+                }
+                AgentEvent::AgentError { message } => panic!("unexpected agent error: {message}"),
+                _ => {}
+            }
+        }
+
+        assert!(restored_prompt_seen);
+        assert!(latest_plan_executed);
+        assert!(finished);
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        cleanup_test_plan_directory(&plan_directory);
+    }
+
+    #[tokio::test]
+    async fn plan_feedback_revises_in_the_same_turn_before_execution() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let tools = Arc::new(registry);
+        let permissions = Arc::new(tokio::sync::Mutex::new(PermissionSystem::new(
+            deepcode_permissions::policy::PermissionSystemConfig::default(),
+        )));
+        let (cmd_tx, cmd_rx) = crate::event::cmd_channel(8);
+        let (event_tx, mut event_rx) = crate::event::event_channel();
+        let plan_directory = test_plan_directory();
+
+        let handle = tokio::spawn(run(
+            Arc::new(ToolLoopProvider::new()),
+            tools,
+            permissions,
+            "test-model".to_string(),
+            (128, 4096),
+            None,
+            None,
+            None,
+            plan_directory.clone(),
+            false,
+            cmd_rx,
+            event_tx,
+        ));
+        cmd_tx
+            .send(AgentCommand::PlanProcess {
+                message: "go".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut approval_count = 0;
+        let mut feedback_in_history = false;
+        let mut disk_edit_seen_in_discussion = false;
+        let mut externally_edited_plan_used = false;
+        let mut first_plan_path = None;
+        let mut finished = false;
+        while let Some(event) = event_rx.recv().await {
+            match &event {
+                AgentEvent::PlanApprovalNeeded {
+                    request_id,
+                    plan_path,
+                    ..
+                } => {
+                    approval_count += 1;
+                    if let Some(first_plan_path) = &first_plan_path {
+                        assert_eq!(plan_path, first_plan_path);
+                    } else {
+                        first_plan_path = Some(plan_path.clone());
+                    }
+                    if approval_count == 1 {
+                        tokio::fs::write(
+                            plan_path,
+                            "# Externally edited draft\n\n1. Preserve this disk edit\n",
+                        )
+                        .await
+                        .unwrap();
+                        cmd_tx
+                            .send(AgentCommand::PlanFeedback {
+                                request_id: request_id.clone(),
+                                feedback: "Add an integration-test step".to_string(),
+                            })
+                            .await
+                            .unwrap();
+                    } else {
+                        tokio::fs::write(
+                            plan_path,
+                            "# Externally edited plan\n\n1. Execute the edited file\n",
+                        )
+                        .await
+                        .unwrap();
+                        cmd_tx
+                            .send(AgentCommand::PlanResponse {
+                                request_id: request_id.clone(),
+                                approved: true,
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+                AgentEvent::SessionUpdated { messages } => {
+                    feedback_in_history |= messages.iter().any(|message| {
+                        message.role == Role::User
+                            && message.content.iter().any(|block| {
+                                matches!(
+                                    block,
+                                    ContentBlock::Text { text }
+                                        if text.contains("Add an integration-test step")
+                                )
+                            })
+                    });
+                    disk_edit_seen_in_discussion |= messages.iter().any(|message| {
+                        message.role == Role::User
+                            && message.content.iter().any(|block| {
+                                matches!(
+                                    block,
+                                    ContentBlock::Text { text }
+                                        if text.contains("Continue discussing the proposed plan")
+                                            && text.contains("# Externally edited draft")
+                                            && text.contains("Preserve this disk edit")
+                                )
+                            })
+                    });
+                    externally_edited_plan_used |= messages.iter().any(|message| {
+                        message.role == Role::User
+                            && message.content.iter().any(|block| {
+                                matches!(
+                                    block,
+                                    ContentBlock::Text { text }
+                                        if text.contains("The user approved this plan")
+                                            && text.contains("# Externally edited plan")
+                                            && text.contains("Execute the edited file")
+                                )
+                            })
+                    });
+                }
+                AgentEvent::AgentFinished { final_message } => {
+                    assert_eq!(final_message, "done");
+                    finished = true;
+                    break;
+                }
+                AgentEvent::AgentError { message } => panic!("unexpected agent error: {message}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(approval_count, 2);
+        assert!(feedback_in_history);
+        assert!(disk_edit_seen_in_discussion);
+        assert!(externally_edited_plan_used);
+        assert!(finished);
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        cleanup_test_plan_directory(&plan_directory);
+    }
+
+    #[tokio::test]
+    async fn missing_plan_file_is_rejected_before_execution() {
+        let events = run_agent_with_invalid_plan_file(InvalidPlanFile::Missing).await;
+
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::AgentError { message } if message.contains("Cannot read plan"))
+        ));
+        assert!(!session_contains_approved_plan(&events));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AgentFinished { .. })));
+    }
+
+    #[tokio::test]
+    async fn empty_plan_file_is_rejected_before_execution() {
+        let events = run_agent_with_invalid_plan_file(InvalidPlanFile::Empty).await;
+
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::AgentError { message } if message.contains("is empty"))
+        ));
+        assert!(!session_contains_approved_plan(&events));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AgentFinished { .. })));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_plan_file_is_rejected_before_execution() {
+        let events = run_agent_with_invalid_plan_file(InvalidPlanFile::Symlink).await;
+
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::AgentError { message } if message.contains("symlinked plan storage path"))
+        ));
+        assert!(!session_contains_approved_plan(&events));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AgentFinished { .. })));
+    }
+
+    #[tokio::test]
     async fn agent_rejects_plan_without_execution() {
         let events = run_plan_agent(false, false).await;
 
@@ -2157,6 +2701,7 @@ mod tests {
             Some("off".to_string()),
             Some("parent agent".to_string()),
             None,
+            test_plan_directory(),
             false,
             cmd_rx,
             event_tx,
@@ -2239,6 +2784,7 @@ mod tests {
             Some("off".to_string()),
             Some("parent agent".to_string()),
             None,
+            test_plan_directory(),
             false,
             cmd_rx,
             event_tx,
